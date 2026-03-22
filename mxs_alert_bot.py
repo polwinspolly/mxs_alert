@@ -17,6 +17,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 
 SYMBOLS = ["BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT", "LINK/USDT:USDT"]
+
 LTF = "15m"
 
 # Per-symbol HTF — SOL uses 1D, all others use 4H
@@ -48,15 +49,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── EXCHANGE ─────────────────────────────────────────────────────────────────
-exchange = ccxt.bybit({
-    "options": {"defaultType": "future"},
+exchange = ccxt.kucoin({
+    "options": {"defaultType": "swap"},
     "enableRateLimit": True,
-    "hostname": "bybit.com",
-    "urls": {
-        "api": {
-            "public": "https://api.bytick.com",
-        }
-    }
 })
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
