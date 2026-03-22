@@ -51,6 +51,12 @@ log = logging.getLogger(__name__)
 exchange = ccxt.bybit({
     "options": {"defaultType": "future"},
     "enableRateLimit": True,
+    "hostname": "bybit.com",
+    "urls": {
+        "api": {
+            "public": "https://api.bytick.com",
+        }
+    }
 })
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
