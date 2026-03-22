@@ -51,6 +51,7 @@ log = logging.getLogger(__name__)
 # ── EXCHANGE ─────────────────────────────────────────────────────────────────
 exchange = ccxt.kucoinfutures({
     "enableRateLimit": True,
+    "rateLimit": 2000,
 })
 
 # ── HELPERS ──────────────────────────────────────────────────────────────────
@@ -249,7 +250,7 @@ def run():
     while True:
         for symbol in SYMBOLS:
             check_symbol(symbol)
-            time.sleep(2)  # Small delay between symbols
+            time.sleep(5)  # Small delay between symbols
 
         next_check = datetime.utcnow().strftime("%H:%M UTC")
         log.info(f"Cycle complete. Next check in 15 min. [{next_check}]")
