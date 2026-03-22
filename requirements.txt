@@ -1,2 +1,2 @@
-ccxt==4.3.95
-pandas==2.2.2
+ccxt
+pandas
