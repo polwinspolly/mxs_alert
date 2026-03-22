@@ -49,8 +49,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # ── EXCHANGE ─────────────────────────────────────────────────────────────────
-exchange = ccxt.kucoin({
-    "options": {"defaultType": "swap"},
+exchange = ccxt.kucoinfutures({
     "enableRateLimit": True,
 })
 
