@@ -100,24 +100,24 @@ def find_pivots(highs, lows, lb: int):
 
 def get_htf_bias(df: pd.DataFrame) -> str:
     """
-    Market structure bias using pivot highs/lows.
-    Bullish = HH + HL (last 2 pivots of each type trending up)
-    Bearish = LH + LL (last 2 pivots of each type trending down)
+    HTF bias using EMA200 slope + price position.
+    More reliable than pivot detection, especially on 1D.
+    Bullish = close > EMA200 and EMA sloping up
+    Bearish = close > EMA200 and EMA sloping down
     """
-    highs = df["high"].values
-    lows  = df["low"].values
+    closes = df["close"]
+    ema200 = closes.ewm(span=50, adjust=False).mean()
 
-    pivot_highs, pivot_lows = find_pivots(highs, lows, HTF_PIVOT_LB)
+    last_close = closes.iloc[-2]
+    ema_now    = ema200.iloc[-2]
+    ema_prev   = ema200.iloc[-6]  # 5 candles ago
 
-    if len(pivot_highs) < 2 or len(pivot_lows) < 2:
-        return "neutral"
+    above_ema = last_close > ema_now
+    ema_rising = ema_now > ema_prev
 
-    sh1, sh2 = pivot_highs[-2][1], pivot_highs[-1][1]
-    sl1, sl2 = pivot_lows[-2][1],  pivot_lows[-1][1]
-
-    if sh2 > sh1 and sl2 > sl1:
+    if above_ema and ema_rising:
         return "long"
-    if sh2 < sh1 and sl2 < sl1:
+    if not above_ema and not ema_rising:
         return "short"
     return "neutral"
 
