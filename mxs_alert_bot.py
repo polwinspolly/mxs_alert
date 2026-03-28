@@ -104,24 +104,15 @@ def find_pivots(highs, lows, lb: int):
             pl.append((i, float(lows[i])))
     return ph, pl
 
-# ── HTF BIAS — BOS STICKY ────────────────────────────────────────────────────
 def get_htf_bias(df: pd.DataFrame) -> str:
     """
-    BOS sticky bias matching MXS candle coloring (blue = long, pink = short):
+    Improved BOS sticky bias with VALIDATED structure:
 
-    In DOWNTREND (short bias):
-      - key_high = most recent pivot high (the Lower High / orange line)
-      - When close > key_high → flip to LONG
-      - key_high always updates to the latest pivot high in the downtrend
-
-    In UPTREND (long bias):
-      - key_low = most recent pivot low (the Higher Low / blue line)
-      - When close < key_low → flip to SHORT
-      - key_low always updates to the latest pivot low in the uptrend
-
-    On flip: reset the opposite key level to the most recent pivot before the BOS candle.
-    Bias is sticky — holds last direction until BOS in opposite direction.
+    Key levels are ONLY updated if they lead to continuation:
+    - Pivot High must lead to downside continuation → valid LH
+    - Pivot Low must lead to upside continuation → valid HL
     """
+
     highs  = df["high"].values
     lows   = df["low"].values
     closes = df["close"].values
@@ -135,61 +126,60 @@ def get_htf_bias(df: pd.DataFrame) -> str:
     ph_at = {i: p for i, p in pivot_highs}
     pl_at = {i: p for i, p in pivot_lows}
 
-    # Seed initial key levels from the first confirmed pivots
-    first_sh_idx = pivot_highs[0][0]
-    first_sl_idx = pivot_lows[0][0]
+    bias = "neutral"
+    key_high = None
+    key_low  = None
 
-    if first_sh_idx < first_sl_idx:
-        key_high = pivot_highs[0][1]
-        key_low  = None
-    else:
-        key_low  = pivot_lows[0][1]
-        key_high = None
+    last_valid_ph = None
+    last_valid_pl = None
 
-    bias      = "neutral"
-    start_idx = min(first_sh_idx, first_sl_idx)
+    # helper: check continuation after pivot
+    def confirms_down_move(idx):
+        # price must make a lower low after pivot high
+        future_lows = lows[idx+1:min(idx+5, n)]  # small lookahead window
+        return len(future_lows) and min(future_lows) < lows[idx]
 
-    for i in range(start_idx, n - 1):  # skip last candle — still forming
+    def confirms_up_move(idx):
+        # price must make a higher high after pivot low
+        future_highs = highs[idx+1:min(idx+5, n)]
+        return len(future_highs) and max(future_highs) > highs[idx]
 
-        # Update key levels as new pivots are confirmed
+    for i in range(n - 1):  # skip last candle
+
+        # ---- VALIDATE PIVOT HIGHS (LH candidates) ----
         if i in ph_at:
-            new_ph = ph_at[i]
-            if bias == "long":
-                # Uptrend: track latest pivot high (not the flip level, just tracking)
-                key_high = new_ph
-            elif bias == "short":
-                # Downtrend: ALWAYS update key_high to the most recent pivot high
-                # This is the LH orange line — the level to watch for BOS up
-                key_high = new_ph
-            else:
-                key_high = new_ph
+            if confirms_down_move(i):
+                last_valid_ph = ph_at[i]
 
+                # Only update key_high in downtrend or neutral
+                if bias in ["short", "neutral"]:
+                    key_high = last_valid_ph
+
+        # ---- VALIDATE PIVOT LOWS (HL candidates) ----
         if i in pl_at:
-            new_pl = pl_at[i]
-            if bias == "short":
-                # Downtrend: track latest pivot low
-                key_low = new_pl
-            elif bias == "long":
-                # Uptrend: ALWAYS update key_low to the most recent pivot low
-                # This is the HL blue line — the level to watch for BOS down
-                key_low = new_pl
-            else:
-                key_low = new_pl
+            if confirms_up_move(i):
+                last_valid_pl = pl_at[i]
+
+                # Only update key_low in uptrend or neutral
+                if bias in ["long", "neutral"]:
+                    key_low = last_valid_pl
 
         c = closes[i]
 
-        # BOS UP: close above most recent pivot high → flip to long
+        # ---- BOS UP (break last valid LH) ----
         if key_high is not None and c > key_high:
             bias = "long"
-            prior_pl = [p for idx, p in pivot_lows if idx <= i]
-            key_low  = prior_pl[-1] if prior_pl else None
-            key_high = None  # reset — will update on next confirmed pivot high
 
-        # BOS DOWN: close below most recent pivot low → flip to short
+            # Reset using last VALID HL
+            key_low  = last_valid_pl
+            key_high = None
+
+        # ---- BOS DOWN (break last valid HL) ----
         elif key_low is not None and c < key_low:
             bias = "short"
-            prior_ph = [p for idx, p in pivot_highs if idx <= i]
-            key_high = prior_ph[-1] if prior_ph else None
+
+            # Reset using last VALID LH
+            key_high = last_valid_ph
             key_low  = None
 
     return bias
