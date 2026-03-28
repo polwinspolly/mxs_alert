@@ -106,11 +106,16 @@ def find_pivots(highs, lows, lb: int):
 
 def get_htf_bias(df: pd.DataFrame) -> str:
     """
-    Improved BOS sticky bias with VALIDATED structure:
+    Hybrid BOS bias (External + Internal structure)
 
-    Key levels are ONLY updated if they lead to continuation:
-    - Pivot High must lead to downside continuation → valid LH
-    - Pivot Low must lead to upside continuation → valid HL
+    - External (pivot-based) = main structure (stable, slower)
+    - Internal (recent HL/LH) = faster flips (like MXS)
+
+    Flip priority:
+    1. Internal BOS (faster reaction)
+    2. External BOS (confirmation)
+
+    Bias is sticky.
     """
 
     highs  = df["high"].values
@@ -127,60 +132,80 @@ def get_htf_bias(df: pd.DataFrame) -> str:
     pl_at = {i: p for i, p in pivot_lows}
 
     bias = "neutral"
+
+    # External structure (pivot-based)
     key_high = None
     key_low  = None
-
     last_valid_ph = None
     last_valid_pl = None
 
-    # helper: check continuation after pivot
+    # Internal structure (fast reaction)
+    internal_hl = None
+    internal_lh = None
+
     def confirms_down_move(idx):
-        # price must make a lower low after pivot high
-        future_lows = lows[idx+1:min(idx+5, n)]  # small lookahead window
+        future_lows = lows[idx+1:min(idx+5, n)]
         return len(future_lows) and min(future_lows) < lows[idx]
 
     def confirms_up_move(idx):
-        # price must make a higher high after pivot low
         future_highs = highs[idx+1:min(idx+5, n)]
         return len(future_highs) and max(future_highs) > highs[idx]
 
-    for i in range(n - 1):  # skip last candle
-
-        # ---- VALIDATE PIVOT HIGHS (LH candidates) ----
-        if i in ph_at:
-            if confirms_down_move(i):
-                last_valid_ph = ph_at[i]
-
-                # Only update key_high in downtrend or neutral
-                if bias in ["short", "neutral"]:
-                    key_high = last_valid_ph
-
-        # ---- VALIDATE PIVOT LOWS (HL candidates) ----
-        if i in pl_at:
-            if confirms_up_move(i):
-                last_valid_pl = pl_at[i]
-
-                # Only update key_low in uptrend or neutral
-                if bias in ["long", "neutral"]:
-                    key_low = last_valid_pl
+    for i in range(2, n - 1):  # skip first candles + last candle
 
         c = closes[i]
 
-        # ---- BOS UP (break last valid LH) ----
+        # -------------------------
+        # INTERNAL STRUCTURE UPDATE
+        # -------------------------
+        if lows[i-1] < lows[i-2] and lows[i-1] < lows[i]:
+            internal_hl = lows[i-1]
+
+        if highs[i-1] > highs[i-2] and highs[i-1] > highs[i]:
+            internal_lh = highs[i-1]
+
+        # -------------------------
+        # EXTERNAL STRUCTURE UPDATE
+        # -------------------------
+        if i in ph_at:
+            if confirms_down_move(i):
+                last_valid_ph = ph_at[i]
+                if bias in ["short", "neutral"]:
+                    key_high = last_valid_ph
+
+        if i in pl_at:
+            if confirms_up_move(i):
+                last_valid_pl = pl_at[i]
+                if bias in ["long", "neutral"]:
+                    key_low = last_valid_pl
+
+        # -------------------------
+        # 🔥 INTERNAL BOS (FAST)
+        # -------------------------
+        if internal_lh is not None and c > internal_lh:
+            bias = "long"
+            key_low = last_valid_pl
+            key_high = None
+            continue
+
+        if internal_hl is not None and c < internal_hl:
+            bias = "short"
+            key_high = last_valid_ph
+            key_low = None
+            continue
+
+        # -------------------------
+        # 🧠 EXTERNAL BOS (CONFIRMATION)
+        # -------------------------
         if key_high is not None and c > key_high:
             bias = "long"
-
-            # Reset using last VALID HL
-            key_low  = last_valid_pl
+            key_low = last_valid_pl
             key_high = None
 
-        # ---- BOS DOWN (break last valid HL) ----
         elif key_low is not None and c < key_low:
             bias = "short"
-
-            # Reset using last VALID LH
             key_high = last_valid_ph
-            key_low  = None
+            key_low = None
 
     return bias
 
