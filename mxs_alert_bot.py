@@ -1,17 +1,20 @@
 """
-MXS v5 Perp Alert Bot — v4
+MXS v5 Perp Alert Bot — v5
 Monitors BTC, ETH, SOL, LINK on KuCoin Futures
 
-HTF Bias: Break-of-Structure (BOS) sticky logic
-  - Tracks key high and key low (pivot-based horizontal levels)
-  - Bullish when close breaks above key high → stays bullish until key low breaks
-  - Bearish when close breaks below key low  → stays bearish until key high breaks
-  - Matches MXS candle coloring: blue = long, red = short, sticky, no random neutral flips
+HTF Bias: Break-of-Structure (BOS) sticky logic — corrected
+  - In downtrend: tracks most recent Lower High (LH) as key_high
+    → Flips to LONG when any candle closes above key_high
+  - In uptrend: tracks most recent Higher Low (HL) as key_low
+    → Flips to SHORT when any candle closes below key_low
+  - Key levels always update to the MOST RECENT pivot in the trend direction
+  - Matches MXS orange/blue horizontal lines and candle coloring exactly
+  - Sticky — no neutral flips mid-trend
 
 LTF Signal: Aggressive close beyond nearest 15M swing high/low
-Stop: Deviation extreme (wick range from swing point to signal candle)
+Stop: Deviation extreme (wick range from swing to signal candle)
 Target: 1.6R | BE: 1R | ATR stop filter: max 2×ATR(14)
-Dedup: ATR bucket grouping (prevents re-alerting same setup)
+Dedup: ATR bucket grouping
 """
 
 import ccxt
@@ -25,7 +28,6 @@ from datetime import datetime, timezone
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 
-# HTF per symbol
 SYMBOL_HTF = {
     "BTC/USDT:USDT":  "1h",
     "ETH/USDT:USDT":  "1h",
@@ -37,10 +39,10 @@ LTF            = "15m"
 TARGET_R       = 1.6
 BE_R           = 1.0
 ATR_LENGTH     = 14
-MAX_STOP_ATR   = 2.0   # Max stop = 2× ATR(14)
-HTF_PIVOT_LB   = 5     # Swing pivot lookback for HTF key levels
-LTF_PIVOT_LB   = 3     # Swing pivot lookback for LTF signal
-LTF_SCAN       = 4     # Candles to scan for fresh LTF signal
+MAX_STOP_ATR   = 2.0
+HTF_PIVOT_LB   = 5
+LTF_PIVOT_LB   = 3
+LTF_SCAN       = 4
 CHECK_INTERVAL = 60 * 15
 FETCH_RETRIES  = 3
 RETRY_DELAY    = 10
@@ -91,7 +93,7 @@ def find_pivots(highs, lows, lb: int):
     """
     Pivot high at i: highs[i] is max in window [i-lb : i+lb]
     Pivot low  at i: lows[i]  is min in window [i-lb : i+lb]
-    Returns (pivot_highs, pivot_lows) as lists of (index, price) tuples.
+    Returns (pivot_highs, pivot_lows) as lists of (index, price).
     """
     ph, pl = [], []
     n = len(highs)
@@ -105,20 +107,20 @@ def find_pivots(highs, lows, lb: int):
 # ── HTF BIAS — BOS STICKY ────────────────────────────────────────────────────
 def get_htf_bias(df: pd.DataFrame) -> str:
     """
-    Break-of-Structure sticky bias matching MXS candle coloring:
+    BOS sticky bias matching MXS candle coloring (blue = long, pink = short):
 
-    Rules (matches what Pol described):
-    - Bias is STICKY — once set, it holds until the opposite key level breaks
-    - Bullish: when close breaks ABOVE the key high → bias = long
-      Stays long as long as price doesn't close BELOW the key low
-    - Bearish: when close breaks BELOW the key low → bias = short
-      Stays short as long as price doesn't close ABOVE the key high
+    In DOWNTREND (short bias):
+      - key_high = most recent pivot high (the Lower High / orange line)
+      - When close > key_high → flip to LONG
+      - key_high always updates to the latest pivot high in the downtrend
 
-    Key levels update as new pivot highs/lows form:
-    - In a long trend: key_low updates to the most recent higher pivot low
-    - In a short trend: key_high updates to the most recent lower pivot high
+    In UPTREND (long bias):
+      - key_low = most recent pivot low (the Higher Low / blue line)
+      - When close < key_low → flip to SHORT
+      - key_low always updates to the latest pivot low in the uptrend
 
-    No "neutral" once structure is established — bias holds last confirmed direction.
+    On flip: reset the opposite key level to the most recent pivot before the BOS candle.
+    Bias is sticky — holds last direction until BOS in opposite direction.
     """
     highs  = df["high"].values
     lows   = df["low"].values
@@ -130,7 +132,6 @@ def get_htf_bias(df: pd.DataFrame) -> str:
     if not pivot_highs or not pivot_lows:
         return "neutral"
 
-    # Index-keyed pivot lookups
     ph_at = {i: p for i, p in pivot_highs}
     pl_at = {i: p for i, p in pivot_lows}
 
@@ -150,41 +151,41 @@ def get_htf_bias(df: pd.DataFrame) -> str:
 
     for i in range(start_idx, n - 1):  # skip last candle — still forming
 
-        # Update key levels as new pivots are confirmed at this candle
+        # Update key levels as new pivots are confirmed
         if i in ph_at:
             new_ph = ph_at[i]
             if bias == "long":
-                # Uptrend: update key_high to latest pivot high (tracks HH)
+                # Uptrend: track latest pivot high (not the flip level, just tracking)
                 key_high = new_ph
             elif bias == "short":
-                # Downtrend: track most recent lower pivot high as resistance
-                if key_high is None or new_ph < key_high:
-                    key_high = new_ph
+                # Downtrend: ALWAYS update key_high to the most recent pivot high
+                # This is the LH orange line — the level to watch for BOS up
+                key_high = new_ph
             else:
                 key_high = new_ph
 
         if i in pl_at:
             new_pl = pl_at[i]
             if bias == "short":
-                # Downtrend: update key_low to latest pivot low (tracks LL)
+                # Downtrend: track latest pivot low
                 key_low = new_pl
             elif bias == "long":
-                # Uptrend: track most recent higher pivot low as support
-                if key_low is None or new_pl > key_low:
-                    key_low = new_pl
+                # Uptrend: ALWAYS update key_low to the most recent pivot low
+                # This is the HL blue line — the level to watch for BOS down
+                key_low = new_pl
             else:
                 key_low = new_pl
 
         c = closes[i]
 
-        # BOS UP: close above key high → flip long
+        # BOS UP: close above most recent pivot high → flip to long
         if key_high is not None and c > key_high:
             bias = "long"
             prior_pl = [p for idx, p in pivot_lows if idx <= i]
             key_low  = prior_pl[-1] if prior_pl else None
-            key_high = None  # will update on next confirmed pivot high
+            key_high = None  # reset — will update on next confirmed pivot high
 
-        # BOS DOWN: close below key low → flip short
+        # BOS DOWN: close below most recent pivot low → flip to short
         elif key_low is not None and c < key_low:
             bias = "short"
             prior_ph = [p for idx, p in pivot_highs if idx <= i]
@@ -196,9 +197,9 @@ def get_htf_bias(df: pd.DataFrame) -> str:
 # ── LTF SIGNAL ───────────────────────────────────────────────────────────────
 def get_ltf_signal(df: pd.DataFrame, bias: str):
     """
-    Aggressive LTF signal: close beyond the nearest confirmed swing in bias direction.
+    Aggressive LTF signal: close beyond nearest confirmed swing in bias direction.
     Stop = deviation extreme (wick range from swing point to signal candle).
-    Scans last LTF_SCAN closed candles. Always skips the last (still forming).
+    Scans last LTF_SCAN closed candles. Skips last (still forming).
     Returns: (direction, entry_price, stop_price) or (None, None, None)
     """
     if bias == "neutral":
@@ -240,7 +241,6 @@ def get_ltf_signal(df: pd.DataFrame, bias: str):
 
 # ── DEDUP KEY ────────────────────────────────────────────────────────────────
 def make_sig_key(signal: str, entry: float, atr: float) -> str:
-    """ATR bucket grouping — prevents re-alerting same setup on consecutive cycles."""
     bucket = round(entry / atr)
     return f"{signal}_{bucket}"
 
@@ -341,12 +341,12 @@ def check_symbol(symbol: str):
 def run():
     symbols = list(SYMBOL_HTF.keys())
     coins   = " · ".join(s.split("/")[0] for s in symbols)
-    log.info(f"MXS Alert Bot v4 started. Monitoring: {coins}")
+    log.info(f"MXS Alert Bot v5 started. Monitoring: {coins}")
     send_telegram(
-        "🤖 <b>MXS Alert Bot v4 started</b>\n"
+        "🤖 <b>MXS Alert Bot v5 started</b>\n"
         f"Monitoring: {coins}\n"
         "HTF: 1H (BTC/ETH/LINK) · 1D (SOL)\n"
-        "Bias: BOS sticky (key high/low breaks)\n"
+        "Bias: BOS sticky — close above LH / below HL\n"
         "Entry: 15M flip · Target: 1.6R · BE: 1R"
     )
 
