@@ -1,8 +1,17 @@
 """
-MXS v5 Perp Alert Bot — v2
+MXS v5 Perp Alert Bot — v4
 Monitors BTC, ETH, SOL, LINK on KuCoin Futures
-Replicates: HTF bias (structure) + 15M LTF flip (aggressive)
-ATR stop filter, 1.6R target, 1R BE
+
+HTF Bias: Break-of-Structure (BOS) sticky logic
+  - Tracks key high and key low (pivot-based horizontal levels)
+  - Bullish when close breaks above key high → stays bullish until key low breaks
+  - Bearish when close breaks below key low  → stays bearish until key high breaks
+  - Matches MXS candle coloring: blue = long, red = short, sticky, no random neutral flips
+
+LTF Signal: Aggressive close beyond nearest 15M swing high/low
+Stop: Deviation extreme (wick range from swing point to signal candle)
+Target: 1.6R | BE: 1R | ATR stop filter: max 2×ATR(14)
+Dedup: ATR bucket grouping (prevents re-alerting same setup)
 """
 
 import ccxt
@@ -16,28 +25,28 @@ from datetime import datetime, timezone
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "YOUR_BOT_TOKEN_HERE")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 
-# Per-symbol HTF — SOL uses 1D, all others use 4H
+# HTF per symbol
 SYMBOL_HTF = {
-    "BTC/USDT:USDT":  "4h",
-    "ETH/USDT:USDT":  "4h",
+    "BTC/USDT:USDT":  "1h",
+    "ETH/USDT:USDT":  "1h",
     "SOL/USDT:USDT":  "1d",
-    "LINK/USDT:USDT": "4h",
+    "LINK/USDT:USDT": "1h",
 }
 
 LTF            = "15m"
 TARGET_R       = 1.6
 BE_R           = 1.0
 ATR_LENGTH     = 14
-MAX_STOP_ATR   = 2.0   # Max stop distance = 2x ATR(14)
-HTF_PIVOT_LB   = 5     # Pivot lookback for HTF structure
-LTF_PIVOT_LB   = 3     # Pivot lookback for LTF signal (smaller = more sensitive)
-LTF_SCAN       = 3     # How many recent candles to scan for a fresh signal
+MAX_STOP_ATR   = 2.0   # Max stop = 2× ATR(14)
+HTF_PIVOT_LB   = 5     # Swing pivot lookback for HTF key levels
+LTF_PIVOT_LB   = 3     # Swing pivot lookback for LTF signal
+LTF_SCAN       = 4     # Candles to scan for fresh LTF signal
 CHECK_INTERVAL = 60 * 15
 FETCH_RETRIES  = 3
-RETRY_DELAY    = 10    # Seconds between retries
+RETRY_DELAY    = 10
 
 # ── STATE ────────────────────────────────────────────────────────────────────
-last_signals = {}  # symbol -> sig_key, prevents duplicate alerts
+last_signals = {}
 
 # ── LOGGING ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -53,82 +62,144 @@ exchange = ccxt.kucoinfutures({
     "rateLimit": 2000,
 })
 
-# ── HELPERS ──────────────────────────────────────────────────────────────────
-
+# ── FETCH ────────────────────────────────────────────────────────────────────
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 150) -> pd.DataFrame:
-    """Fetch OHLCV with retry logic."""
     for attempt in range(1, FETCH_RETRIES + 1):
         try:
             raw = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
             if not raw or len(raw) < 20:
-                raise ValueError(f"Insufficient data ({len(raw) if raw else 0} candles)")
-            df = pd.DataFrame(raw, columns=["ts", "open", "high", "low", "close", "vol"])
+                raise ValueError(f"Only {len(raw) if raw else 0} candles returned")
+            df = pd.DataFrame(raw, columns=["ts","open","high","low","close","vol"])
             df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-            df = df.set_index("ts").sort_index()
-            return df
+            return df.set_index("ts").sort_index()
         except Exception as e:
             if attempt < FETCH_RETRIES:
-                log.warning(f"Fetch attempt {attempt} failed for {symbol} {timeframe}: {e}. Retrying in {RETRY_DELAY}s...")
+                log.warning(f"Fetch attempt {attempt} failed [{symbol} {timeframe}]: {e}. Retry in {RETRY_DELAY}s")
                 time.sleep(RETRY_DELAY)
             else:
                 raise
 
-
+# ── ATR ──────────────────────────────────────────────────────────────────────
 def calc_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
     h, l, c = df["high"], df["low"], df["close"]
     prev_c = c.shift(1)
     tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
     return tr.ewm(alpha=1 / length, adjust=False).mean()
 
-
+# ── PIVOT DETECTION ───────────────────────────────────────────────────────────
 def find_pivots(highs, lows, lb: int):
     """
-    Detect swing highs and lows using a pivot lookback window.
-    Returns lists of (index, price) tuples.
+    Pivot high at i: highs[i] is max in window [i-lb : i+lb]
+    Pivot low  at i: lows[i]  is min in window [i-lb : i+lb]
+    Returns (pivot_highs, pivot_lows) as lists of (index, price) tuples.
     """
-    pivot_highs, pivot_lows = [], []
+    ph, pl = [], []
     n = len(highs)
     for i in range(lb, n - lb):
-        window_h = highs[i - lb: i + lb + 1]
-        window_l = lows[i - lb: i + lb + 1]
-        if highs[i] == max(window_h):
-            pivot_highs.append((i, highs[i]))
-        if lows[i] == min(window_l):
-            pivot_lows.append((i, lows[i]))
-    return pivot_highs, pivot_lows
+        if highs[i] == max(highs[i - lb: i + lb + 1]):
+            ph.append((i, float(highs[i])))
+        if lows[i] == min(lows[i - lb: i + lb + 1]):
+            pl.append((i, float(lows[i])))
+    return ph, pl
 
-
+# ── HTF BIAS — BOS STICKY ────────────────────────────────────────────────────
 def get_htf_bias(df: pd.DataFrame) -> str:
     """
-    HTF bias using EMA200 slope + price position.
-    More reliable than pivot detection, especially on 1D.
-    Bullish = close > EMA200 and EMA sloping up
-    Bearish = close > EMA200 and EMA sloping down
+    Break-of-Structure sticky bias matching MXS candle coloring:
+
+    Rules (matches what Pol described):
+    - Bias is STICKY — once set, it holds until the opposite key level breaks
+    - Bullish: when close breaks ABOVE the key high → bias = long
+      Stays long as long as price doesn't close BELOW the key low
+    - Bearish: when close breaks BELOW the key low → bias = short
+      Stays short as long as price doesn't close ABOVE the key high
+
+    Key levels update as new pivot highs/lows form:
+    - In a long trend: key_low updates to the most recent higher pivot low
+    - In a short trend: key_high updates to the most recent lower pivot high
+
+    No "neutral" once structure is established — bias holds last confirmed direction.
     """
-    closes = df["close"]
-    ema200 = closes.ewm(span=50, adjust=False).mean()
+    highs  = df["high"].values
+    lows   = df["low"].values
+    closes = df["close"].values
+    n      = len(df)
 
-    last_close = closes.iloc[-2]
-    ema_now    = ema200.iloc[-2]
-    ema_prev   = ema200.iloc[-6]  # 5 candles ago
+    pivot_highs, pivot_lows = find_pivots(highs, lows, HTF_PIVOT_LB)
 
-    above_ema = last_close > ema_now
-    ema_rising = ema_now > ema_prev
+    if not pivot_highs or not pivot_lows:
+        return "neutral"
 
-    if above_ema and ema_rising:
-        return "long"
-    if not above_ema and not ema_rising:
-        return "short"
-    return "neutral"
+    # Index-keyed pivot lookups
+    ph_at = {i: p for i, p in pivot_highs}
+    pl_at = {i: p for i, p in pivot_lows}
 
+    # Seed initial key levels from the first confirmed pivots
+    first_sh_idx = pivot_highs[0][0]
+    first_sl_idx = pivot_lows[0][0]
 
+    if first_sh_idx < first_sl_idx:
+        key_high = pivot_highs[0][1]
+        key_low  = None
+    else:
+        key_low  = pivot_lows[0][1]
+        key_high = None
+
+    bias      = "neutral"
+    start_idx = min(first_sh_idx, first_sl_idx)
+
+    for i in range(start_idx, n - 1):  # skip last candle — still forming
+
+        # Update key levels as new pivots are confirmed at this candle
+        if i in ph_at:
+            new_ph = ph_at[i]
+            if bias == "long":
+                # Uptrend: update key_high to latest pivot high (tracks HH)
+                key_high = new_ph
+            elif bias == "short":
+                # Downtrend: track most recent lower pivot high as resistance
+                if key_high is None or new_ph < key_high:
+                    key_high = new_ph
+            else:
+                key_high = new_ph
+
+        if i in pl_at:
+            new_pl = pl_at[i]
+            if bias == "short":
+                # Downtrend: update key_low to latest pivot low (tracks LL)
+                key_low = new_pl
+            elif bias == "long":
+                # Uptrend: track most recent higher pivot low as support
+                if key_low is None or new_pl > key_low:
+                    key_low = new_pl
+            else:
+                key_low = new_pl
+
+        c = closes[i]
+
+        # BOS UP: close above key high → flip long
+        if key_high is not None and c > key_high:
+            bias = "long"
+            prior_pl = [p for idx, p in pivot_lows if idx <= i]
+            key_low  = prior_pl[-1] if prior_pl else None
+            key_high = None  # will update on next confirmed pivot high
+
+        # BOS DOWN: close below key low → flip short
+        elif key_low is not None and c < key_low:
+            bias = "short"
+            prior_ph = [p for idx, p in pivot_highs if idx <= i]
+            key_high = prior_ph[-1] if prior_ph else None
+            key_low  = None
+
+    return bias
+
+# ── LTF SIGNAL ───────────────────────────────────────────────────────────────
 def get_ltf_signal(df: pd.DataFrame, bias: str):
     """
-    Detect a fresh LTF structure break in the direction of bias.
-    Scans the last LTF_SCAN closed candles for a valid signal.
-    Aggressive mode: signal fires on close beyond the nearest swing.
-
-    Returns: (direction, entry, stop_level) or (None, None, None)
+    Aggressive LTF signal: close beyond the nearest confirmed swing in bias direction.
+    Stop = deviation extreme (wick range from swing point to signal candle).
+    Scans last LTF_SCAN closed candles. Always skips the last (still forming).
+    Returns: (direction, entry_price, stop_price) or (None, None, None)
     """
     if bias == "neutral":
         return None, None, None
@@ -140,10 +211,9 @@ def get_ltf_signal(df: pd.DataFrame, bias: str):
 
     pivot_highs, pivot_lows = find_pivots(highs, lows, LTF_PIVOT_LB)
 
-    # Scan recent closed candles for a signal (skip last — still forming)
     for offset in range(2, LTF_SCAN + 2):
         signal_idx = n - offset
-        if signal_idx < 10:
+        if signal_idx < LTF_PIVOT_LB + 5:
             continue
 
         entry = closes[signal_idx]
@@ -152,23 +222,29 @@ def get_ltf_signal(df: pd.DataFrame, bias: str):
             prior_highs = [ph for ph in pivot_highs if ph[0] < signal_idx]
             if not prior_highs:
                 continue
-            nearest_sh_idx, nearest_sh_price = prior_highs[-1]
-            if entry > nearest_sh_price:
-                stop = min(lows[nearest_sh_idx:signal_idx + 1])
-                return "long", entry, stop
+            sh_idx, sh_price = prior_highs[-1]
+            if entry > sh_price:
+                stop = float(min(lows[sh_idx: signal_idx + 1]))
+                return "long", float(entry), stop
 
         elif bias == "short":
             prior_lows = [pl for pl in pivot_lows if pl[0] < signal_idx]
             if not prior_lows:
                 continue
-            nearest_sl_idx, nearest_sl_price = prior_lows[-1]
-            if entry < nearest_sl_price:
-                stop = max(highs[nearest_sl_idx:signal_idx + 1])
-                return "short", entry, stop
+            sl_idx, sl_price = prior_lows[-1]
+            if entry < sl_price:
+                stop = float(max(highs[sl_idx: signal_idx + 1]))
+                return "short", float(entry), stop
 
     return None, None, None
 
+# ── DEDUP KEY ────────────────────────────────────────────────────────────────
+def make_sig_key(signal: str, entry: float, atr: float) -> str:
+    """ATR bucket grouping — prevents re-alerting same setup on consecutive cycles."""
+    bucket = round(entry / atr)
+    return f"{signal}_{bucket}"
 
+# ── TELEGRAM ─────────────────────────────────────────────────────────────────
 def send_telegram(message: str):
     import urllib.request, urllib.parse
     url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -181,28 +257,26 @@ def send_telegram(message: str):
         try:
             req = urllib.request.Request(url, data=data)
             urllib.request.urlopen(req, timeout=15)
-            log.info("Telegram message sent.")
+            log.info("Telegram sent.")
             return
         except Exception as e:
             if attempt < 3:
                 time.sleep(5)
             else:
-                log.error(f"Telegram send failed after 3 attempts: {e}")
+                log.error(f"Telegram failed after 3 attempts: {e}")
 
-
+# ── FORMAT ALERT ─────────────────────────────────────────────────────────────
 def format_alert(symbol: str, direction: str, entry: float, stop: float,
                  atr_val: float, htf: str) -> str:
     stop_dist = abs(entry - stop)
-    r1  = entry + stop_dist * BE_R     if direction == "long" else entry - stop_dist * BE_R
+    be  = entry + stop_dist * BE_R     if direction == "long" else entry - stop_dist * BE_R
     tp  = entry + stop_dist * TARGET_R if direction == "long" else entry - stop_dist * TARGET_R
     pct = (stop_dist / entry) * 100
     emoji = "🟢 LONG" if direction == "long" else "🔴 SHORT"
     coin  = symbol.split("/")[0]
     now   = datetime.now(timezone.utc).strftime("%H:%M UTC")
-
-    # Dynamic decimal places based on price magnitude
-    decimals = 2 if entry > 100 else (4 if entry > 1 else 6)
-    fmt = f".{decimals}f"
+    d     = 2 if entry > 100 else (4 if entry > 1 else 6)
+    fmt   = f".{d}f"
 
     return (
         f"<b>⚡ MXS SIGNAL — {coin} {emoji}</b>\n"
@@ -210,83 +284,80 @@ def format_alert(symbol: str, direction: str, entry: float, stop: float,
         f"🕐 <b>Time:</b> {now}\n"
         f"📍 <b>Entry:</b> {entry:{fmt}}\n"
         f"🛑 <b>Stop:</b> {stop:{fmt}} ({pct:.2f}%)\n"
-        f"🎯 <b>BE (1R):</b> {r1:{fmt}}\n"
+        f"🎯 <b>BE (1R):</b> {be:{fmt}}\n"
         f"🎯 <b>TP (1.6R):</b> {tp:{fmt}}\n"
         f"📊 <b>ATR(14):</b> {atr_val:{fmt}}\n"
         f"━━━━━━━━━━━━━━━━\n"
         f"<i>MXS v5 Perp · {htf.upper()} bias + 15M flip</i>"
     )
 
-
-# ── MAIN ─────────────────────────────────────────────────────────────────────
-
+# ── CHECK SYMBOL ─────────────────────────────────────────────────────────────
 def check_symbol(symbol: str):
-    htf = SYMBOL_HTF.get(symbol, "4h")
+    htf = SYMBOL_HTF.get(symbol, "1h")
     try:
         log.info(f"Checking {symbol}...")
 
-        # Fetch data
         df_htf = fetch_ohlcv(symbol, htf, limit=150)
         df_ltf = fetch_ohlcv(symbol, LTF, limit=100)
 
-        # Step 1: HTF bias
+        # Step 1: BOS sticky HTF bias
         bias = get_htf_bias(df_htf)
         log.info(f"  {symbol} {htf.upper()} bias: {bias}")
         if bias == "neutral":
             return
 
-        # Step 2: LTF signal
+        # Step 2: LTF aggressive signal
         signal, entry, stop = get_ltf_signal(df_ltf, bias)
         if not signal:
             log.info(f"  {symbol} no LTF signal")
             return
 
-        # Step 3: ATR stop filter
+        # Step 3: ATR stop distance filter
         atr_series  = calc_atr(df_ltf, ATR_LENGTH)
-        current_atr = atr_series.iloc[-2]
+        current_atr = float(atr_series.iloc[-2])
         stop_dist   = abs(entry - stop)
         max_stop    = MAX_STOP_ATR * current_atr
 
         if stop_dist > max_stop:
-            log.info(f"  {symbol} signal skipped — stop too wide ({stop_dist:.4f} > 2xATR {max_stop:.4f})")
+            log.info(f"  {symbol} skipped — stop {stop_dist:.4f} > 2×ATR {max_stop:.4f}")
             return
 
-        # Step 4: Deduplicate
-        sig_key = f"{signal}_{round(entry, 4)}"
-        if last_signals.get(symbol) == sig_key:
-            log.info(f"  {symbol} duplicate signal, skipping.")
+        # Step 4: ATR bucket deduplication
+        key = make_sig_key(signal, entry, current_atr)
+        if last_signals.get(symbol) == key:
+            log.info(f"  {symbol} duplicate, skipping")
             return
+        last_signals[symbol] = key
 
-        last_signals[symbol] = sig_key
-
-        # Step 5: Alert
+        # Step 5: Send alert
         msg = format_alert(symbol, signal, entry, stop, current_atr, htf)
         send_telegram(msg)
-        log.info(f"  Alert sent: {symbol} {signal} @ {entry}")
+        log.info(f"  ✅ Alert: {symbol} {signal} entry={entry:.4f} stop={stop:.4f}")
 
     except Exception as e:
-        log.error(f"Error checking {symbol} ({htf}): {e}")
+        log.error(f"Error [{symbol}]: {e}")
 
-
+# ── MAIN LOOP ────────────────────────────────────────────────────────────────
 def run():
     symbols = list(SYMBOL_HTF.keys())
-    log.info("MXS Alert Bot v2 started. Monitoring: " + ", ".join(s.split("/")[0] for s in symbols))
+    coins   = " · ".join(s.split("/")[0] for s in symbols)
+    log.info(f"MXS Alert Bot v4 started. Monitoring: {coins}")
     send_telegram(
-        "🤖 <b>MXS Alert Bot v2 started</b>\n"
-        "Monitoring: BTC · ETH · SOL · LINK\n"
-        "HTF: 4H (BTC/ETH/LINK) · 1D (SOL)\n"
+        "🤖 <b>MXS Alert Bot v4 started</b>\n"
+        f"Monitoring: {coins}\n"
+        "HTF: 1H (BTC/ETH/LINK) · 1D (SOL)\n"
+        "Bias: BOS sticky (key high/low breaks)\n"
         "Entry: 15M flip · Target: 1.6R · BE: 1R"
     )
 
     while True:
         for symbol in symbols:
             check_symbol(symbol)
-            time.sleep(5)  # Delay between symbols to avoid rate limits
+            time.sleep(5)
 
         now = datetime.now(timezone.utc).strftime("%H:%M UTC")
-        log.info(f"Cycle complete. Next check in 15 min. [{now}]")
+        log.info(f"Cycle done. Next in 15 min [{now}]")
         time.sleep(CHECK_INTERVAL)
-
 
 if __name__ == "__main__":
     run()
