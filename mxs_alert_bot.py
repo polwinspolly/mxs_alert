@@ -507,7 +507,15 @@ def run():
         status = "✅" if TRADE_CONDITIONS[k] else "❌"
         cond_lines.append(f"{status} {label}")
 
-    log.info(f"MXS Alert Bot v9 started. Monitoring: {coins}")
+    log.info(f"MXS Alert Bot v9.2 started. Monitoring: {coins}")
+
+    # Seed close timestamps with current time so first signals must come from
+    # fresh candles after startup — prevents firing on stale historical breaks
+    startup_ts = datetime.now(timezone.utc)
+    for symbol in symbols:
+        trade_close_ts[symbol] = startup_ts
+    log.info(f"Startup timestamp set: {startup_ts.strftime('%H:%M UTC')} — waiting for fresh candles")
+
     send_telegram(
         "🤖 <b>MXS Alert Bot v9.2 started</b>\n"
         f"Monitoring: {coins}\n"
