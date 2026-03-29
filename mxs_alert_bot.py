@@ -1,5 +1,5 @@
 """
-MXS v5 Perp Alert Bot — v9
+MXS v5 Perp Alert Bot — v9.2
 Monitors BTC, ETH, SOL, LINK on KuCoin Futures
 
 NEW in v9: Active Trade Tracker
@@ -62,6 +62,7 @@ TRADE_CONDITIONS = {
 # ── STATE ────────────────────────────────────────────────────────────────────
 last_signals  = {}   # symbol -> sig_key (dedup)
 active_trades = {}   # symbol -> trade dict
+trade_close_ts = {}  # symbol -> pd.Timestamp of when last trade closed
 
 # Trade dict structure:
 # {
@@ -215,14 +216,20 @@ def get_htf_bias(df: pd.DataFrame) -> str:
     return bias
 
 # ── LTF SIGNAL ───────────────────────────────────────────────────────────────
-def get_ltf_signal(df: pd.DataFrame, bias: str):
+def get_ltf_signal(df: pd.DataFrame, bias: str, after_ts=None):
+    """
+    after_ts: if provided (pd.Timestamp), only consider signal candles whose
+    index (close time) is strictly after this timestamp. This prevents picking
+    up stale candles from before the previous trade closed.
+    """
     if bias == "neutral":
         return None, None, None
 
-    highs  = df["high"].values
-    lows   = df["low"].values
-    closes = df["close"].values
-    n      = len(df)
+    highs      = df["high"].values
+    lows       = df["low"].values
+    closes     = df["close"].values
+    timestamps = df.index
+    n          = len(df)
 
     pivot_highs, pivot_lows = find_pivots(highs, lows, LTF_PIVOT_LB)
 
@@ -230,6 +237,12 @@ def get_ltf_signal(df: pd.DataFrame, bias: str):
         signal_idx = n - offset
         if signal_idx < LTF_PIVOT_LB + 5:
             continue
+
+        # Timestamp filter — skip candles that closed before/at the trade close time
+        if after_ts is not None and timestamps[signal_idx] <= after_ts:
+            log.info(f"    Skipping stale candle at {timestamps[signal_idx]} (trade closed at {after_ts})")
+            continue
+
         entry = closes[signal_idx]
 
         if bias == "long":
@@ -395,6 +408,7 @@ def check_active_trade(symbol: str, current_price: float, current_bias: str) -> 
         if stopped:
             reason = "BREAKEVEN HIT" if be_moved else "STOP LOSS"
             send_telegram(fmt_exit(symbol, trade, reason, current_price))
+            trade_close_ts[symbol] = datetime.now(timezone.utc)
             del active_trades[symbol]
             log.info(f"  ❌ Trade closed ({reason}): {symbol}")
             return True
@@ -405,6 +419,7 @@ def check_active_trade(symbol: str, current_price: float, current_bias: str) -> 
                    (direction == "short" and current_price <= tp)
         if targeted:
             send_telegram(fmt_exit(symbol, trade, "TARGET HIT", current_price))
+            trade_close_ts[symbol] = datetime.now(timezone.utc)
             del active_trades[symbol]
             log.info(f"  ✅ Trade closed (TARGET): {symbol}")
             return True
@@ -415,6 +430,7 @@ def check_active_trade(symbol: str, current_price: float, current_bias: str) -> 
                        (direction == "short" and current_bias == "long")
         if bias_flipped:
             send_telegram(fmt_exit(symbol, trade, "HTF BIAS FLIP", current_price))
+            trade_close_ts[symbol] = datetime.now(timezone.utc)
             del active_trades[symbol]
             log.info(f"  🔄 Trade closed (BIAS FLIP): {symbol}")
             return True
@@ -442,13 +458,16 @@ def check_symbol(symbol: str):
             if not trade_closed:
                 log.info(f"  {symbol} trade active, skipping signal scan")
                 return
-            # Trade was closed — fall through to scan for new signal
+            # Trade just closed — fall through but pass close timestamp to filter stale candles
 
         if bias == "neutral":
             return
 
+        # Get close timestamp filter — only accept signals from candles after last trade close
+        after_ts = trade_close_ts.get(symbol)
+
         # Scan for new LTF signal
-        signal, entry, stop = get_ltf_signal(df_ltf, bias)
+        signal, entry, stop = get_ltf_signal(df_ltf, bias, after_ts=after_ts)
         if not signal:
             log.info(f"  {symbol} no LTF signal")
             return
@@ -490,7 +509,7 @@ def run():
 
     log.info(f"MXS Alert Bot v9 started. Monitoring: {coins}")
     send_telegram(
-        "🤖 <b>MXS Alert Bot v9 started</b>\n"
+        "🤖 <b>MXS Alert Bot v9.2 started</b>\n"
         f"Monitoring: {coins}\n"
         "HTF: 1H (BTC/ETH/LINK) · 1D (SOL)\n"
         "━━━━━━━━━━━━━━━━\n"
