@@ -1,5 +1,5 @@
 """
-MXS v5 Perp Alert Bot — v7
+MXS v5 Perp Alert Bot — v8
 Monitors BTC, ETH, SOL, LINK on KuCoin Futures
 
 HTF Bias: Hybrid 2-layer BOS (v6 — direction-aware internal + external pivot)
@@ -334,12 +334,9 @@ def check_symbol(symbol: str):
 
         atr_series  = calc_atr(df_ltf, ATR_LENGTH)
         current_atr = float(atr_series.iloc[-2])
-        stop_dist   = abs(entry - stop)
-        max_stop    = MAX_STOP_ATR * current_atr
 
-        if stop_dist > max_stop:
-            log.info(f"  {symbol} skipped — stop {stop_dist:.4f} > 2×ATR {max_stop:.4f}")
-            return
+        # ATR filter removed — matches MXS Perp settings (Max Stop Distance = OFF)
+        # Stop placement is already controlled by deviation extreme logic
 
         key = make_sig_key(signal, entry, current_atr)
         if last_signals.get(symbol) == key:
@@ -360,11 +357,11 @@ def run():
     coins   = " · ".join(s.split("/")[0] for s in symbols)
     log.info(f"MXS Alert Bot v7 started. Monitoring: {coins}")
     send_telegram(
-        "🤖 <b>MXS Alert Bot v7 started</b>\n"
+        "🤖 <b>MXS Alert Bot v8 started</b>\n"
         f"Monitoring: {coins}\n"
         "HTF: 1H (BTC/ETH/LINK) · 1D (SOL)\n"
         "Bias: Hybrid BOS — internal LH/HL + external pivot\n"
-        "Signal: multi-pivot walk (v7 fix)\n"
+        "Signal: multi-pivot walk · No ATR stop filter\n"
         "Entry: 15M flip · Target: 1.6R · BE: 1R"
     )
     while True:
