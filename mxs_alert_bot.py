@@ -1,25 +1,21 @@
 """
-MXS v5 Perp Alert Bot — v6
+MXS v5 Perp Alert Bot — v7
 Monitors BTC, ETH, SOL, LINK on KuCoin Futures
 
-HTF Bias: Hybrid 2-layer BOS (matches MXS candle coloring)
+HTF Bias: Hybrid 2-layer BOS (v6 — direction-aware internal + external pivot)
+  INTERNAL (fast): tracks LH when short, HL when long → flips on close beyond level
+  EXTERNAL (slow): confirmed pivot with forward confirmation → establishes + confirms bias
 
-  INTERNAL structure (lb=2, fast):
-    - Tracks internal LH when bias=short → close above = flip long
-    - Tracks internal HL when bias=long  → close below = flip short
-    - Direction-aware: only tracks the level relevant to current bias
-    - Fires first (priority) — catches early flips like the ETH/BTC screenshots
+LTF Signal: FIXED — multi-pivot walk (v7 key fix)
+  BUG in v6: only checked nearest pivot low/high
+    → if signal candle itself created a new lower pivot, the scanner would
+       find that new pivot and fail the entry < pivot check, missing the signal
+  FIX: walk all prior pivots from newest to oldest
+    → finds the first pivot where entry actually breaks it
+    → correctly catches BTC-style breakdowns where the signal candle
+       creates a new extreme while still being below the PRIOR swing
 
-  EXTERNAL structure (lb=5, slow):
-    - Confirmed pivot highs/lows with forward confirmation
-    - Establishes initial bias from first confirmed pivots
-    - Acts as confirmation and catches moves internal misses
-
-  Bias is sticky — holds last confirmed direction until opposite BOS fires.
-  No random neutral flips mid-trend.
-
-LTF Signal: Aggressive close beyond nearest 15M swing high/low
-Stop: Deviation extreme (wick range from swing to signal candle)
+Stop: Deviation extreme (wick range from broken swing to signal candle)
 Target: 1.6R | BE: 1R | ATR stop filter: max 2×ATR(14)
 Dedup: ATR bucket grouping
 """
@@ -47,9 +43,9 @@ TARGET_R       = 1.6
 BE_R           = 1.0
 ATR_LENGTH     = 14
 MAX_STOP_ATR   = 2.0
-HTF_PIVOT_LB   = 5     # External pivot lookback
-LTF_PIVOT_LB   = 3     # LTF signal pivot lookback
-LTF_SCAN       = 4     # Candles to scan for LTF signal
+HTF_PIVOT_LB   = 5
+LTF_PIVOT_LB   = 3
+LTF_SCAN       = 4
 CHECK_INTERVAL = 60 * 15
 FETCH_RETRIES  = 3
 RETRY_DELAY    = 10
@@ -116,19 +112,18 @@ def get_htf_bias(df: pd.DataFrame) -> str:
     """
     Hybrid 2-layer BOS bias matching MXS candle coloring.
 
-    INTERNAL (fast, lb=2 equivalent — 3-bar detection):
-      Tracks direction-relevant level only:
-      - bias=short: watches internal LH → close above = flip long
-      - bias=long:  watches internal HL → close below = flip short
-      Direction-aware prevents false flips from normal pullbacks.
+    INTERNAL (fast, 3-bar detection, direction-aware):
+      - bias=short: tracks internal LH → close above = flip long
+      - bias=long:  tracks internal HL → close below = flip short
+      Only tracks the level relevant to current bias — prevents false flips
+      from normal pullbacks in trending markets.
 
-    EXTERNAL (slow, lb=HTF_PIVOT_LB):
-      - Uses confirmed pivots with forward-movement confirmation
+    EXTERNAL (slow, confirmed pivots with forward confirmation):
       - Establishes initial bias
       - Catches major structure breaks internal misses
 
     Priority: internal fires first → external as fallback.
-    Bias is sticky — no neutral once established.
+    Bias is sticky — holds last confirmed direction.
     """
     highs  = df["high"].values
     lows   = df["low"].values
@@ -142,13 +137,13 @@ def get_htf_bias(df: pd.DataFrame) -> str:
     ph_at = {i: p for i, p in ext_ph}
     pl_at = {i: p for i, p in ext_pl}
 
-    bias         = "neutral"
-    key_high     = None   # external resistance level
-    key_low      = None   # external support level
-    last_valid_ph = None  # last confirmed external pivot high
-    last_valid_pl = None  # last confirmed external pivot low
-    int_key_high  = None  # internal LH — watched when bias=short
-    int_key_low   = None  # internal HL — watched when bias=long
+    bias          = "neutral"
+    key_high      = None
+    key_low       = None
+    last_valid_ph = None
+    last_valid_pl = None
+    int_key_high  = None
+    int_key_low   = None
 
     def confirms_down_move(idx):
         future = lows[idx + 1: min(idx + 5, n)]
@@ -158,25 +153,21 @@ def get_htf_bias(df: pd.DataFrame) -> str:
         future = highs[idx + 1: min(idx + 5, n)]
         return len(future) > 0 and max(future) > highs[idx]
 
-    first_sh = ext_ph[0][0]
-    first_sl = ext_pl[0][0]
-    start    = min(first_sh, first_sl)
+    start = min(ext_ph[0][0], ext_pl[0][0])
 
     for i in range(max(start, 2), n - 1):
         c = closes[i]
 
-        # ── Internal swing point detection (3-bar: bar i-1 is local extreme) ──
+        # Internal swing point detection (direction-aware)
         if lows[i-1] < lows[i-2] and lows[i-1] < lows[i]:
             if bias == "long":
-                # In uptrend: track this HL as support — BOS down if broken
-                int_key_low = lows[i-1]
+                int_key_low = lows[i-1]  # HL — watch for BOS down
 
         if highs[i-1] > highs[i-2] and highs[i-1] > highs[i]:
             if bias == "short":
-                # In downtrend: track this LH as resistance — BOS up if broken
-                int_key_high = highs[i-1]
+                int_key_high = highs[i-1]  # LH — watch for BOS up
 
-        # ── External pivot confirmation ───────────────────────────────────────
+        # External pivot confirmation
         if i in ph_at:
             if confirms_down_move(i):
                 last_valid_ph = ph_at[i]
@@ -189,7 +180,7 @@ def get_htf_bias(df: pd.DataFrame) -> str:
                 if bias in ("long", "neutral"):
                     key_low = last_valid_pl
 
-        # ── INTERNAL BOS (priority) ───────────────────────────────────────────
+        # Internal BOS (priority)
         if bias == "short" and int_key_high is not None and c > int_key_high:
             bias = "long"
             key_low      = last_valid_pl
@@ -206,7 +197,7 @@ def get_htf_bias(df: pd.DataFrame) -> str:
             int_key_high = None
             continue
 
-        # ── EXTERNAL BOS (establishes initial bias + confirmation) ────────────
+        # External BOS
         if key_high is not None and c > key_high:
             bias = "long"
             key_low      = last_valid_pl
@@ -223,12 +214,19 @@ def get_htf_bias(df: pd.DataFrame) -> str:
 
     return bias
 
-# ── LTF SIGNAL ───────────────────────────────────────────────────────────────
+# ── LTF SIGNAL — MULTI-PIVOT WALK (v7 fix) ───────────────────────────────────
 def get_ltf_signal(df: pd.DataFrame, bias: str):
     """
-    Aggressive LTF signal: close beyond nearest confirmed swing in bias direction.
-    Stop = deviation extreme (wick range from swing to signal candle).
-    Scans last LTF_SCAN closed candles. Skips last (still forming).
+    Aggressive LTF signal: close beyond a prior swing in bias direction.
+
+    KEY FIX (v7): walks all prior pivots from newest to oldest.
+    Old behavior: only checked the single nearest pivot → missed signals
+    when the signal candle itself created a new extreme pivot, making the
+    nearest pivot unreachable (e.g. BTC breakdown at 1:30 UTC).
+    New behavior: iterates pivots newest→oldest, returns on first match.
+
+    Stop = deviation extreme (wick range from broken swing to signal candle).
+    Scans last LTF_SCAN closed candles. Always skips last (still forming).
     Returns: (direction, entry_price, stop_price) or (None, None, None)
     """
     if bias == "neutral":
@@ -250,21 +248,19 @@ def get_ltf_signal(df: pd.DataFrame, bias: str):
 
         if bias == "long":
             prior_highs = [ph for ph in pivot_highs if ph[0] < signal_idx]
-            if not prior_highs:
-                continue
-            sh_idx, sh_price = prior_highs[-1]
-            if entry > sh_price:
-                stop = float(min(lows[sh_idx: signal_idx + 1]))
-                return "long", float(entry), stop
+            # Walk newest → oldest: find first pivot high entry broke above
+            for sh_idx, sh_price in reversed(prior_highs):
+                if entry > sh_price:
+                    stop = float(min(lows[sh_idx: signal_idx + 1]))
+                    return "long", float(entry), stop
 
         elif bias == "short":
             prior_lows = [pl for pl in pivot_lows if pl[0] < signal_idx]
-            if not prior_lows:
-                continue
-            sl_idx, sl_price = prior_lows[-1]
-            if entry < sl_price:
-                stop = float(max(highs[sl_idx: signal_idx + 1]))
-                return "short", float(entry), stop
+            # Walk newest → oldest: find first pivot low entry broke below
+            for sl_idx, sl_price in reversed(prior_lows):
+                if entry < sl_price:
+                    stop = float(max(highs[sl_idx: signal_idx + 1]))
+                    return "short", float(entry), stop
 
     return None, None, None
 
@@ -362,12 +358,13 @@ def check_symbol(symbol: str):
 def run():
     symbols = list(SYMBOL_HTF.keys())
     coins   = " · ".join(s.split("/")[0] for s in symbols)
-    log.info(f"MXS Alert Bot v6 started. Monitoring: {coins}")
+    log.info(f"MXS Alert Bot v7 started. Monitoring: {coins}")
     send_telegram(
-        "🤖 <b>MXS Alert Bot v6 started</b>\n"
+        "🤖 <b>MXS Alert Bot v7 started</b>\n"
         f"Monitoring: {coins}\n"
         "HTF: 1H (BTC/ETH/LINK) · 1D (SOL)\n"
         "Bias: Hybrid BOS — internal LH/HL + external pivot\n"
+        "Signal: multi-pivot walk (v7 fix)\n"
         "Entry: 15M flip · Target: 1.6R · BE: 1R"
     )
     while True:
