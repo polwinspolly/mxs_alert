@@ -250,9 +250,15 @@ def get_ltf_signal(df: pd.DataFrame, bias: str, after_ts=None):
             continue
 
         # Timestamp filter — reject stale candles from before trade close
-        if after_ts is not None and timestamps[signal_idx] <= after_ts:
-            log.info(f"    Skipping stale candle at {timestamps[signal_idx]} (after_ts={after_ts})")
-            continue
+        if after_ts is not None:
+            # Normalize both to naive UTC for comparison
+            candle_ts = timestamps[signal_idx]
+            if hasattr(candle_ts, 'tzinfo') and candle_ts.tzinfo is not None:
+                candle_ts = candle_ts.replace(tzinfo=None)
+            after_naive = after_ts.replace(tzinfo=None) if hasattr(after_ts, 'tzinfo') and after_ts.tzinfo is not None else after_ts
+            if candle_ts <= after_naive:
+                log.info(f"    Skipping stale candle at {candle_ts} (after_ts={after_naive})")
+                continue
 
         entry = closes[signal_idx]
 
@@ -437,7 +443,7 @@ def check_active_trade(symbol: str, current_price: float, current_bias: str) -> 
         if stopped:
             reason = "BREAKEVEN HIT" if be_moved else "STOP LOSS"
             send_telegram(fmt_exit(symbol, trade, reason, current_price))
-            trade_close_ts[symbol] = datetime.now(timezone.utc)
+            trade_close_ts[symbol] = datetime.now(timezone.utc).replace(tzinfo=None)
             del active_trades[symbol]
             log.info(f"  ❌ Trade closed ({reason}): {symbol}")
             return True
@@ -448,7 +454,7 @@ def check_active_trade(symbol: str, current_price: float, current_bias: str) -> 
                    (direction == "short" and current_price <= tp)
         if targeted:
             send_telegram(fmt_exit(symbol, trade, "TARGET HIT", current_price))
-            trade_close_ts[symbol] = datetime.now(timezone.utc)
+            trade_close_ts[symbol] = datetime.now(timezone.utc).replace(tzinfo=None)
             del active_trades[symbol]
             log.info(f"  ✅ Trade closed (TARGET): {symbol}")
             return True
@@ -459,7 +465,7 @@ def check_active_trade(symbol: str, current_price: float, current_bias: str) -> 
                        (direction == "short" and current_bias == "long")
         if bias_flipped:
             send_telegram(fmt_exit(symbol, trade, "HTF BIAS FLIP", current_price))
-            trade_close_ts[symbol] = datetime.now(timezone.utc)
+            trade_close_ts[symbol] = datetime.now(timezone.utc).replace(tzinfo=None)
             del active_trades[symbol]
             log.info(f"  🔄 Trade closed (BIAS FLIP): {symbol}")
             return True
@@ -540,7 +546,7 @@ def run():
 
     # Seed close timestamps with current time so first signals must come from
     # fresh candles after startup — prevents firing on stale historical breaks
-    startup_ts = datetime.now(timezone.utc)
+    startup_ts = datetime.now(timezone.utc).replace(tzinfo=None)
     for symbol in symbols:
         trade_close_ts[symbol] = startup_ts
     log.info(f"Startup timestamp set: {startup_ts.strftime('%H:%M UTC')} — waiting for fresh candles")
