@@ -1,5 +1,5 @@
 """
-MXS v5 Perp Alert Bot — v9.2
+MXS v5 Perp Alert Bot — v9.3
 Monitors BTC, ETH, SOL, LINK on KuCoin Futures
 
 NEW in v9: Active Trade Tracker
@@ -215,12 +215,23 @@ def get_htf_bias(df: pd.DataFrame) -> str:
 
     return bias
 
-# ── LTF SIGNAL ───────────────────────────────────────────────────────────────
+# ── LTF SIGNAL — HYBRID 2-LAYER (v9.2 fix) ───────────────────────────────────
 def get_ltf_signal(df: pd.DataFrame, bias: str, after_ts=None):
     """
-    after_ts: if provided (pd.Timestamp), only consider signal candles whose
-    index (close time) is strictly after this timestamp. This prevents picking
-    up stale candles from before the previous trade closed.
+    Hybrid 2-layer LTF signal matching MXS Green/Yellow zone logic:
+
+    INTERNAL (fast, Green/Yellow zone):
+      - Detects local high/low on the bar BEFORE the signal candle
+      - Internal LH: highs[i-1] > highs[i-2] → close above = Green zone long
+      - Internal HL: lows[i-1]  < lows[i-2]  → close below = Yellow zone short
+      - Fires even when LTF bias conflicts with HTF (e.g. LTF bearish but HTF bull)
+      - Signal candle itself is the breakout — no requirement that it be lower/higher
+
+    EXTERNAL (slower, confirmed pivot break):
+      - Standard pivot detection with multi-pivot walk (v7 fix)
+      - Fallback when internal doesn't detect a clean break
+
+    after_ts: only accept signal candles whose timestamp is strictly after this.
     """
     if bias == "neutral":
         return None, None, None
@@ -231,29 +242,47 @@ def get_ltf_signal(df: pd.DataFrame, bias: str, after_ts=None):
     timestamps = df.index
     n          = len(df)
 
-    pivot_highs, pivot_lows = find_pivots(highs, lows, LTF_PIVOT_LB)
+    ext_ph, ext_pl = find_pivots(highs, lows, LTF_PIVOT_LB)
 
     for offset in range(2, LTF_SCAN + 2):
         signal_idx = n - offset
         if signal_idx < LTF_PIVOT_LB + 5:
             continue
 
-        # Timestamp filter — skip candles that closed before/at the trade close time
+        # Timestamp filter — reject stale candles from before trade close
         if after_ts is not None and timestamps[signal_idx] <= after_ts:
-            log.info(f"    Skipping stale candle at {timestamps[signal_idx]} (trade closed at {after_ts})")
+            log.info(f"    Skipping stale candle at {timestamps[signal_idx]} (after_ts={after_ts})")
             continue
 
         entry = closes[signal_idx]
 
+        # ── INTERNAL (Green/Yellow zone) ──────────────────────────────────────
+        if signal_idx >= 2:
+            # Internal LH: prev bar high is higher than bar before it
+            int_lh = highs[signal_idx-1] if highs[signal_idx-1] > highs[signal_idx-2] else None
+            # Internal HL: prev bar low is lower than bar before it
+            int_hl = lows[signal_idx-1]  if lows[signal_idx-1]  < lows[signal_idx-2]  else None
+
+            if bias == "long" and int_lh is not None and entry > int_lh:
+                # Green zone: close above internal LH
+                stop = float(min(lows[max(0, signal_idx - 5): signal_idx + 1]))
+                return "long", float(entry), stop
+
+            if bias == "short" and int_hl is not None and entry < int_hl:
+                # Yellow zone: close below internal HL
+                stop = float(max(highs[max(0, signal_idx - 5): signal_idx + 1]))
+                return "short", float(entry), stop
+
+        # ── EXTERNAL (confirmed pivot break) ─────────────────────────────────
         if bias == "long":
-            prior_highs = [ph for ph in pivot_highs if ph[0] < signal_idx]
+            prior_highs = [ph for ph in ext_ph if ph[0] < signal_idx]
             for sh_idx, sh_price in reversed(prior_highs):
                 if entry > sh_price:
                     stop = float(min(lows[sh_idx: signal_idx + 1]))
                     return "long", float(entry), stop
 
         elif bias == "short":
-            prior_lows = [pl for pl in pivot_lows if pl[0] < signal_idx]
+            prior_lows = [pl for pl in ext_pl if pl[0] < signal_idx]
             for sl_idx, sl_price in reversed(prior_lows):
                 if entry < sl_price:
                     stop = float(max(highs[sl_idx: signal_idx + 1]))
@@ -517,7 +546,7 @@ def run():
     log.info(f"Startup timestamp set: {startup_ts.strftime('%H:%M UTC')} — waiting for fresh candles")
 
     send_telegram(
-        "🤖 <b>MXS Alert Bot v9.2 started</b>\n"
+        "🤖 <b>MXS Alert Bot v9.3 started</b>\n"
         f"Monitoring: {coins}\n"
         "HTF: 1H (BTC/ETH/LINK) · 1D (SOL)\n"
         "━━━━━━━━━━━━━━━━\n"
