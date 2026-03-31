@@ -1,5 +1,5 @@
 """
-MXS v5 Perp Alert Bot — v9.4
+MXS v5 Perp Alert Bot — v9.5
 Monitors BTC, ETH, SOL, LINK on KuCoin Futures
 
 NEW in v9: Active Trade Tracker
@@ -305,17 +305,23 @@ def get_ltf_signal(df: pd.DataFrame, bias: str, after_ts=None):
                 stop = float(max(highs[max(0, signal_idx - 5): signal_idx + 1]))
                 return "short", float(entry), stop
 
-        # ── EXTERNAL (confirmed pivot break) ─────────────────────────────────
+        # ── EXTERNAL — stop = deviation extreme of the broken pivot ───────────
         if bias == "long":
             for sh_idx, sh_price in reversed([ph for ph in ext_ph if ph[0] < signal_idx]):
                 if entry > sh_price:
-                    stop = float(min(lows[sh_idx: signal_idx + 1]))
+                    # Stop = lowest wick within window around the pivot (deviation extreme)
+                    w0 = max(0, sh_idx - 2)
+                    w1 = min(n, sh_idx + 3)
+                    stop = float(min(lows[w0: w1]))
                     return "long", float(entry), stop
 
         elif bias == "short":
             for sl_idx, sl_price in reversed([pl for pl in ext_pl if pl[0] < signal_idx]):
                 if entry < sl_price:
-                    stop = float(max(highs[sl_idx: signal_idx + 1]))
+                    # Stop = highest wick within window around the pivot (deviation extreme)
+                    w0 = max(0, sl_idx - 2)
+                    w1 = min(n, sl_idx + 3)
+                    stop = float(max(highs[w0: w1]))
                     return "short", float(entry), stop
 
     return None, None, None
@@ -576,7 +582,7 @@ def run():
     log.info(f"Startup timestamp set: {startup_ts.strftime('%H:%M UTC')} — waiting for fresh candles")
 
     send_telegram(
-        "🤖 <b>MXS Alert Bot v9.4 started</b>\n"
+        "🤖 <b>MXS Alert Bot v9.5 started</b>\n"
         f"Monitoring: {coins}\n"
         "HTF: 1H (BTC/ETH/LINK) · 1D (SOL)\n"
         "━━━━━━━━━━━━━━━━\n"
