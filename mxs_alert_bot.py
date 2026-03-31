@@ -1,5 +1,5 @@
 """
-MXS v5 Perp Alert Bot — v9.6
+MXS v5 Perp Alert Bot — v9.7
 Monitors BTC, ETH, SOL, LINK on KuCoin Futures
 
 NEW in v9: Active Trade Tracker
@@ -47,6 +47,7 @@ ATR_LENGTH     = 14
 HTF_PIVOT_LB   = 5
 LTF_PIVOT_LB   = 3
 LTF_SCAN       = 4
+MAX_PIVOT_AGE  = 20  # max candles between broken pivot and signal — keeps signals fresh
 CHECK_INTERVAL = 60 * 15
 FETCH_RETRIES  = 3
 RETRY_DELAY    = 10
@@ -280,6 +281,8 @@ def get_ltf_signal(df: pd.DataFrame, bias: str, ltf_zone: str = "neutral", after
         # ── EXTERNAL — stop = deviation extreme of the broken pivot ───────────
         if bias == "long":
             for sh_idx, sh_price in reversed([ph for ph in ext_ph if ph[0] < signal_idx]):
+                if signal_idx - sh_idx > MAX_PIVOT_AGE:
+                    break  # pivot too old — different market phase, stop searching
                 if entry > sh_price:
                     w0 = max(0, sh_idx - 2)
                     w1 = min(n, sh_idx + 3)
@@ -288,6 +291,8 @@ def get_ltf_signal(df: pd.DataFrame, bias: str, ltf_zone: str = "neutral", after
 
         elif bias == "short":
             for sl_idx, sl_price in reversed([pl for pl in ext_pl if pl[0] < signal_idx]):
+                if signal_idx - sl_idx > MAX_PIVOT_AGE:
+                    break  # pivot too old — different market phase, stop searching
                 if entry < sl_price:
                     w0 = max(0, sl_idx - 2)
                     w1 = min(n, sl_idx + 3)
@@ -556,7 +561,7 @@ def run():
     log.info(f"Startup timestamp set: {startup_ts.strftime('%H:%M UTC')} — waiting for fresh candles")
 
     send_telegram(
-        "🤖 <b>MXS Alert Bot v9.6 started</b>\n"
+        "🤖 <b>MXS Alert Bot v9.7 started</b>\n"
         f"Monitoring: {coins}\n"
         "HTF: 1H (BTC/ETH/LINK) · 1D (SOL)\n"
         "━━━━━━━━━━━━━━━━\n"
