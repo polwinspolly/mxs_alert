@@ -1,5 +1,5 @@
 """
-MXS v5 Perp Alert Bot — v9.5
+MXS v5 Perp Alert Bot — v9.6
 Monitors BTC, ETH, SOL, LINK on KuCoin Futures
 
 NEW in v9: Active Trade Tracker
@@ -215,47 +215,20 @@ def get_htf_bias(df: pd.DataFrame) -> str:
 
     return bias
 
-# ── LTF ZONE DETECTION ───────────────────────────────────────────────────────
-def get_zone(highs, lows, idx, lookback=6) -> str:
+# ── LTF SIGNAL — HYBRID 2-LAYER WITH ZONE GATE (v9.6) ───────────────────────
+def get_ltf_signal(df: pd.DataFrame, bias: str, ltf_zone: str = "neutral", after_ts=None):
     """
-    Determine LTF detailed zone at signal candle — matches MXS Green/Yellow zone.
-    Green zone (bullish): lows rising + highs not strongly falling → longs only
-    Yellow zone (bearish): highs falling + lows not strongly rising → shorts only
-    Neutral: mixed → external confirmed pivots allowed through
-    """
-    start = max(0, idx - lookback)
-    rl = lows[start: idx + 1]
-    rh = highs[start: idx + 1]
-    if len(rl) < 3:
-        return "neutral"
-    l_rising  = sum(1 for i in range(1, len(rl)) if rl[i] > rl[i-1])
-    l_falling = sum(1 for i in range(1, len(rl)) if rl[i] < rl[i-1])
-    h_rising  = sum(1 for i in range(1, len(rh)) if rh[i] > rh[i-1])
-    h_falling = sum(1 for i in range(1, len(rh)) if rh[i] < rh[i-1])
-    if l_rising > l_falling and h_rising >= h_falling:
-        return "bullish"
-    if h_falling > h_rising and l_falling >= l_rising:
-        return "bearish"
-    return "neutral"
+    Hybrid 2-layer LTF signal with proper zone gate.
 
-# ── LTF SIGNAL — HYBRID 2-LAYER WITH ZONE GATE (v9.3) ───────────────────────
-def get_ltf_signal(df: pd.DataFrame, bias: str, after_ts=None):
-    """
-    Hybrid 2-layer LTF signal with zone agreement gate:
+    ZONE GATE — uses same BOS logic as HTF bias but on 15M data:
+      ltf_zone = get_htf_bias(df_ltf) → "long" | "short" | "neutral"
+      Green zone (ltf_zone=long):    only longs pass
+      Yellow zone (ltf_zone=short):  only shorts pass
+      Neutral:                        both pass (external pivot still required)
 
-    ZONE GATE (applied to both layers):
-      Green zone (bullish): only longs pass — blocks shorts even on external pivots
-      Yellow zone (bearish): only shorts pass — blocks longs even on external pivots
-      Neutral: both directions allowed (external pivot confirmation still required)
-      This matches MXS: Green zone = longs only, Yellow zone = shorts only
-
-    INTERNAL (fast, Green/Yellow zone):
-      Fires when close breaks above/below a local high/low (3-bar detection)
-      Only fires when zone agrees with signal direction
-
-    EXTERNAL (slower, confirmed pivot break):
-      Multi-pivot walk — fallback when internal doesn't fire
-      Still gated by zone to prevent false signals like the SOL +3.15% stop
+    INTERNAL (fast): close breaks 3-bar local high/low
+    EXTERNAL (slower): confirmed pivot break with multi-pivot walk
+    Both gated by ltf_zone.
 
     after_ts: only accept signal candles strictly after this timestamp.
     """
@@ -287,10 +260,9 @@ def get_ltf_signal(df: pd.DataFrame, bias: str, after_ts=None):
 
         entry = closes[signal_idx]
 
-        # Zone gate — blocks signals that conflict with LTF detailed zone
-        zone = get_zone(highs, lows, signal_idx)
-        if bias == "long"  and zone == "bearish": continue
-        if bias == "short" and zone == "bullish": continue
+        # Zone gate — LTF BOS zone must agree with signal direction
+        if bias == "long"  and ltf_zone == "short": continue
+        if bias == "short" and ltf_zone == "long":  continue
 
         # ── INTERNAL (Green/Yellow zone) ──────────────────────────────────────
         if signal_idx >= 2:
@@ -309,7 +281,6 @@ def get_ltf_signal(df: pd.DataFrame, bias: str, after_ts=None):
         if bias == "long":
             for sh_idx, sh_price in reversed([ph for ph in ext_ph if ph[0] < signal_idx]):
                 if entry > sh_price:
-                    # Stop = lowest wick within window around the pivot (deviation extreme)
                     w0 = max(0, sh_idx - 2)
                     w1 = min(n, sh_idx + 3)
                     stop = float(min(lows[w0: w1]))
@@ -318,7 +289,6 @@ def get_ltf_signal(df: pd.DataFrame, bias: str, after_ts=None):
         elif bias == "short":
             for sl_idx, sl_price in reversed([pl for pl in ext_pl if pl[0] < signal_idx]):
                 if entry < sl_price:
-                    # Stop = highest wick within window around the pivot (deviation extreme)
                     w0 = max(0, sl_idx - 2)
                     w1 = min(n, sl_idx + 3)
                     stop = float(max(highs[w0: w1]))
@@ -528,11 +498,15 @@ def check_symbol(symbol: str):
         if bias == "neutral":
             return
 
-        # Get close timestamp filter — only accept signals from candles after last trade close
+        # Get close timestamp filter
         after_ts = trade_close_ts.get(symbol)
 
+        # Compute LTF zone using same BOS logic as HTF — this is MXS Green/Yellow zone
+        ltf_zone = get_htf_bias(df_ltf)
+        log.info(f"  {symbol} 15M zone: {ltf_zone}")
+
         # Scan for new LTF signal
-        signal, entry, stop = get_ltf_signal(df_ltf, bias, after_ts=after_ts)
+        signal, entry, stop = get_ltf_signal(df_ltf, bias, ltf_zone=ltf_zone, after_ts=after_ts)
         if not signal:
             log.info(f"  {symbol} no LTF signal")
             return
@@ -582,7 +556,7 @@ def run():
     log.info(f"Startup timestamp set: {startup_ts.strftime('%H:%M UTC')} — waiting for fresh candles")
 
     send_telegram(
-        "🤖 <b>MXS Alert Bot v9.5 started</b>\n"
+        "🤖 <b>MXS Alert Bot v9.6 started</b>\n"
         f"Monitoring: {coins}\n"
         "HTF: 1H (BTC/ETH/LINK) · 1D (SOL)\n"
         "━━━━━━━━━━━━━━━━\n"
