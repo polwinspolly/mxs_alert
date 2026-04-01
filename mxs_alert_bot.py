@@ -1,5 +1,5 @@
 """
-MXS v5 Perp Alert Bot — v9.9
+MXS v5 Perp Alert Bot — v9.10
 Monitors BTC, ETH, SOL, LINK on KuCoin Futures
 
 NEW in v9: Active Trade Tracker
@@ -49,6 +49,7 @@ LTF_PIVOT_LB   = 3
 LTF_SCAN       = 4
 MAX_PIVOT_AGE  = 20  # max candles between broken pivot and signal — keeps signals fresh
 MIN_BOUNCE     = 2   # min candles moving against signal direction between pivot and signal
+KEY_RANGE_LB   = 20  # candles to compute Key High/Low range — signal must break outside
 CHECK_INTERVAL = 60 * 15
 FETCH_RETRIES  = 3
 RETRY_DELAY    = 10
@@ -217,6 +218,28 @@ def get_htf_bias(df: pd.DataFrame) -> str:
 
     return bias
 
+# ── KEY RANGE FILTER ─────────────────────────────────────────────────────────
+def is_inside_range(closes, highs, lows, signal_idx: int, direction: str) -> bool:
+    """
+    Returns True if signal entry is INSIDE the Key High/Low range → block.
+    Returns False if entry breaks OUTSIDE → allow.
+
+    MXS only fires signals when price breaks beyond the current Key High (longs)
+    or Key Low (shorts) — not on internal micro-structure while ranging.
+
+    Key High = highest high of last KEY_RANGE_LB candles before signal.
+    Key Low  = lowest low  of last KEY_RANGE_LB candles before signal.
+    """
+    start    = max(0, signal_idx - KEY_RANGE_LB)
+    key_high = float(max(highs[start: signal_idx]))
+    key_low  = float(min(lows[start:  signal_idx]))
+    entry    = float(closes[signal_idx])
+
+    if direction == "long":
+        return entry <= key_high   # at or below key high = still inside range
+    else:
+        return entry >= key_low    # at or above key low = still inside range
+
 # ── BOUNCE VERIFICATION ───────────────────────────────────────────────────────
 def has_bounce(closes, pivot_idx: int, signal_idx: int, direction: str) -> bool:
     """
@@ -300,12 +323,14 @@ def get_ltf_signal(df: pd.DataFrame, bias: str, ltf_zone: str = "neutral", after
             int_hl = lows[signal_idx-1]  if lows[signal_idx-1]  < lows[signal_idx-2]  else None
 
             if bias == "long" and int_lh is not None and entry > int_lh:
-                # Stop = lowest wick of signal candle and 2 prior candles (tight deviation extreme)
+                if is_inside_range(closes, highs, lows, signal_idx, "long"):
+                    continue  # entry still inside Key High/Low range — not a valid break
                 stop = float(min(lows[max(0, signal_idx - 2): signal_idx + 1]))
                 return "long", float(entry), stop
 
             if bias == "short" and int_hl is not None and entry < int_hl:
-                # Stop = highest wick of signal candle and 2 prior candles (tight deviation extreme)
+                if is_inside_range(closes, highs, lows, signal_idx, "short"):
+                    continue  # entry still inside Key High/Low range — not a valid break
                 stop = float(max(highs[max(0, signal_idx - 2): signal_idx + 1]))
                 return "short", float(entry), stop
 
@@ -313,11 +338,12 @@ def get_ltf_signal(df: pd.DataFrame, bias: str, ltf_zone: str = "neutral", after
         if bias == "long":
             for sh_idx, sh_price in reversed([ph for ph in ext_ph if ph[0] < signal_idx]):
                 if signal_idx - sh_idx > MAX_PIVOT_AGE:
-                    break  # pivot too old — different market phase, stop searching
+                    break
                 if entry > sh_price:
-                    # Verify a real dip happened between pivot and signal
                     if not has_bounce(closes, sh_idx, signal_idx, "long"):
                         continue
+                    if is_inside_range(closes, highs, lows, signal_idx, "long"):
+                        continue  # entry still inside range
                     w0 = max(0, sh_idx - 2)
                     w1 = min(n, sh_idx + 3)
                     stop = float(min(lows[w0: w1]))
@@ -326,11 +352,12 @@ def get_ltf_signal(df: pd.DataFrame, bias: str, ltf_zone: str = "neutral", after
         elif bias == "short":
             for sl_idx, sl_price in reversed([pl for pl in ext_pl if pl[0] < signal_idx]):
                 if signal_idx - sl_idx > MAX_PIVOT_AGE:
-                    break  # pivot too old — different market phase, stop searching
+                    break
                 if entry < sl_price:
-                    # Verify a real bounce happened between pivot and signal
                     if not has_bounce(closes, sl_idx, signal_idx, "short"):
                         continue
+                    if is_inside_range(closes, highs, lows, signal_idx, "short"):
+                        continue  # entry still inside range
                     w0 = max(0, sl_idx - 2)
                     w1 = min(n, sl_idx + 3)
                     stop = float(max(highs[w0: w1]))
@@ -600,7 +627,7 @@ def run():
     log.info(f"Startup timestamp set: {startup_ts.strftime('%H:%M UTC')} — waiting for fresh candles")
 
     send_telegram(
-        "🤖 <b>MXS Alert Bot v9.9 started</b>\n"
+        "🤖 <b>MXS Alert Bot v9.10 started</b>\n"
         f"Monitoring: {coins}\n"
         "HTF: 1H (BTC/ETH/LINK) · 1D (SOL)\n"
         "━━━━━━━━━━━━━━━━\n"
