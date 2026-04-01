@@ -1,5 +1,5 @@
 """
-MXS v5 Perp Alert Bot — v9.7
+MXS v5 Perp Alert Bot — v9.8
 Monitors BTC, ETH, SOL, LINK on KuCoin Futures
 
 NEW in v9: Active Trade Tracker
@@ -48,6 +48,7 @@ HTF_PIVOT_LB   = 5
 LTF_PIVOT_LB   = 3
 LTF_SCAN       = 4
 MAX_PIVOT_AGE  = 20  # max candles between broken pivot and signal — keeps signals fresh
+MIN_BOUNCE     = 2   # min candles moving against signal direction between pivot and signal
 CHECK_INTERVAL = 60 * 15
 FETCH_RETRIES  = 3
 RETRY_DELAY    = 10
@@ -216,6 +217,34 @@ def get_htf_bias(df: pd.DataFrame) -> str:
 
     return bias
 
+# ── BOUNCE VERIFICATION ───────────────────────────────────────────────────────
+def has_bounce(closes, pivot_idx: int, signal_idx: int, direction: str) -> bool:
+    """
+    Verify a real pullback/bounce happened between pivot and signal candle.
+
+    For short: price must have bounced UP (≥ MIN_BOUNCE candles closed above
+               the pivot close) between pivot and signal — confirming a real
+               bounce-then-breakdown, not a continuous momentum drop.
+
+    For long:  price must have dipped DOWN (≥ MIN_BOUNCE candles closed below
+               the pivot close) between pivot and signal — confirming a real
+               dip-then-breakout, not a continuous momentum rise.
+
+    This prevents firing on free-fall / parabolic moves where there's no
+    structure forming between the pivot and the signal candle.
+    """
+    if signal_idx <= pivot_idx + 1:
+        return False
+    pivot_close = closes[pivot_idx]
+    between     = closes[pivot_idx + 1: signal_idx]
+    if len(between) < MIN_BOUNCE:
+        return False
+    if direction == "short":
+        bounced = sum(1 for c in between if c > pivot_close)
+    else:
+        bounced = sum(1 for c in between if c < pivot_close)
+    return bounced >= MIN_BOUNCE
+
 # ── LTF SIGNAL — HYBRID 2-LAYER WITH ZONE GATE (v9.6) ───────────────────────
 def get_ltf_signal(df: pd.DataFrame, bias: str, ltf_zone: str = "neutral", after_ts=None):
     """
@@ -284,6 +313,9 @@ def get_ltf_signal(df: pd.DataFrame, bias: str, ltf_zone: str = "neutral", after
                 if signal_idx - sh_idx > MAX_PIVOT_AGE:
                     break  # pivot too old — different market phase, stop searching
                 if entry > sh_price:
+                    # Verify a real dip happened between pivot and signal
+                    if not has_bounce(closes, sh_idx, signal_idx, "long"):
+                        continue
                     w0 = max(0, sh_idx - 2)
                     w1 = min(n, sh_idx + 3)
                     stop = float(min(lows[w0: w1]))
@@ -294,6 +326,9 @@ def get_ltf_signal(df: pd.DataFrame, bias: str, ltf_zone: str = "neutral", after
                 if signal_idx - sl_idx > MAX_PIVOT_AGE:
                     break  # pivot too old — different market phase, stop searching
                 if entry < sl_price:
+                    # Verify a real bounce happened between pivot and signal
+                    if not has_bounce(closes, sl_idx, signal_idx, "short"):
+                        continue
                     w0 = max(0, sl_idx - 2)
                     w1 = min(n, sl_idx + 3)
                     stop = float(max(highs[w0: w1]))
@@ -561,7 +596,7 @@ def run():
     log.info(f"Startup timestamp set: {startup_ts.strftime('%H:%M UTC')} — waiting for fresh candles")
 
     send_telegram(
-        "🤖 <b>MXS Alert Bot v9.7 started</b>\n"
+        "🤖 <b>MXS Alert Bot v9.8 started</b>\n"
         f"Monitoring: {coins}\n"
         "HTF: 1H (BTC/ETH/LINK) · 1D (SOL)\n"
         "━━━━━━━━━━━━━━━━\n"
