@@ -1,5 +1,5 @@
 """
-MXS v5 Perp Alert Bot — v9.8
+MXS v5 Perp Alert Bot — v9.9
 Monitors BTC, ETH, SOL, LINK on KuCoin Futures
 
 NEW in v9: Active Trade Tracker
@@ -300,11 +300,13 @@ def get_ltf_signal(df: pd.DataFrame, bias: str, ltf_zone: str = "neutral", after
             int_hl = lows[signal_idx-1]  if lows[signal_idx-1]  < lows[signal_idx-2]  else None
 
             if bias == "long" and int_lh is not None and entry > int_lh:
-                stop = float(min(lows[max(0, signal_idx - 5): signal_idx + 1]))
+                # Stop = lowest wick of signal candle and 2 prior candles (tight deviation extreme)
+                stop = float(min(lows[max(0, signal_idx - 2): signal_idx + 1]))
                 return "long", float(entry), stop
 
             if bias == "short" and int_hl is not None and entry < int_hl:
-                stop = float(max(highs[max(0, signal_idx - 5): signal_idx + 1]))
+                # Stop = highest wick of signal candle and 2 prior candles (tight deviation extreme)
+                stop = float(max(highs[max(0, signal_idx - 2): signal_idx + 1]))
                 return "short", float(entry), stop
 
         # ── EXTERNAL — stop = deviation extreme of the broken pivot ───────────
@@ -542,7 +544,9 @@ def check_symbol(symbol: str):
         after_ts = trade_close_ts.get(symbol)
 
         # Compute LTF zone using same BOS logic as HTF — this is MXS Green/Yellow zone
-        ltf_zone = get_htf_bias(df_ltf)
+        # Use only last 30 candles to capture RECENT micro-structure (not full session history)
+        # This prevents full-session bullish bias overriding a recent Yellow zone
+        ltf_zone = get_htf_bias(df_ltf.tail(30))
         log.info(f"  {symbol} 15M zone: {ltf_zone}")
 
         # Scan for new LTF signal
@@ -596,7 +600,7 @@ def run():
     log.info(f"Startup timestamp set: {startup_ts.strftime('%H:%M UTC')} — waiting for fresh candles")
 
     send_telegram(
-        "🤖 <b>MXS Alert Bot v9.8 started</b>\n"
+        "🤖 <b>MXS Alert Bot v9.9 started</b>\n"
         f"Monitoring: {coins}\n"
         "HTF: 1H (BTC/ETH/LINK) · 1D (SOL)\n"
         "━━━━━━━━━━━━━━━━\n"
