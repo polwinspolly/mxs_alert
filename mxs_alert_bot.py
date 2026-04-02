@@ -1,5 +1,5 @@
 """
-MXS v5 Perp Alert Bot — v9.10
+MXS v5 Perp Alert Bot — v10.0
 Monitors BTC, ETH, SOL, LINK on KuCoin Futures
 
 NEW in v9: Active Trade Tracker
@@ -16,8 +16,8 @@ HTF Bias: Hybrid 2-layer BOS
   INTERNAL: direction-aware LH/HL tracking → fast flip
   EXTERNAL: confirmed pivot with forward confirmation → establishes bias
 
-LTF Signal: Multi-pivot walk (v7 fix)
-  Walks pivots newest→oldest to find first broken level
+LTF Signal: Key Range Break (v10 fix)
+  Fires only when close breaks Key High/Low (confirmed pivots, not rolling max/min)
 
 Stop: Deviation extreme | Target: 1.6R | BE: 1R
 """
@@ -218,28 +218,6 @@ def get_htf_bias(df: pd.DataFrame) -> str:
 
     return bias
 
-# ── KEY RANGE FILTER ─────────────────────────────────────────────────────────
-def is_inside_range(closes, highs, lows, signal_idx: int, direction: str) -> bool:
-    """
-    Returns True if signal entry is INSIDE the Key High/Low range → block.
-    Returns False if entry breaks OUTSIDE → allow.
-
-    MXS only fires signals when price breaks beyond the current Key High (longs)
-    or Key Low (shorts) — not on internal micro-structure while ranging.
-
-    Key High = highest high of last KEY_RANGE_LB candles before signal.
-    Key Low  = lowest low  of last KEY_RANGE_LB candles before signal.
-    """
-    start    = max(0, signal_idx - KEY_RANGE_LB)
-    key_high = float(max(highs[start: signal_idx]))
-    key_low  = float(min(lows[start:  signal_idx]))
-    entry    = float(closes[signal_idx])
-
-    if direction == "long":
-        return entry <= key_high   # at or below key high = still inside range
-    else:
-        return entry >= key_low    # at or above key low = still inside range
-
 # ── BOUNCE VERIFICATION ───────────────────────────────────────────────────────
 def has_bounce(closes, pivot_idx: int, signal_idx: int, direction: str) -> bool:
     """
@@ -268,25 +246,33 @@ def has_bounce(closes, pivot_idx: int, signal_idx: int, direction: str) -> bool:
         bounced = sum(1 for c in between if c < pivot_close)
     return bounced >= MIN_BOUNCE
 
-# ── LTF SIGNAL — HYBRID 2-LAYER WITH ZONE GATE (v9.6) ───────────────────────
+# ── LTF SIGNAL — PIVOT-BASED KEY RANGE BREAK (v10) ──────────────────────────
 def get_ltf_signal(df: pd.DataFrame, bias: str, ltf_zone: str = "neutral", after_ts=None):
     """
-    Hybrid 2-layer LTF signal with proper zone gate.
+    MXS-style LTF signal: fires ONLY when price breaks outside the Key High/Low
+    range defined by confirmed pivots — not on internal micro-structure.
 
-    ZONE GATE — uses same BOS logic as HTF bias but on 15M data:
-      ltf_zone = get_htf_bias(df_ltf) → "long" | "short" | "neutral"
-      Green zone (ltf_zone=long):    only longs pass
-      Yellow zone (ltf_zone=short):  only shorts pass
-      Neutral:                        both pass (external pivot still required)
+    Key High = highest confirmed pivot high in last KEY_RANGE_LB candles
+    Key Low  = lowest confirmed pivot low  in last KEY_RANGE_LB candles
 
-    INTERNAL (fast): close breaks 3-bar local high/low
-    EXTERNAL (slower): confirmed pivot break with multi-pivot walk
-    Both gated by ltf_zone.
+    Signal requires ALL of:
+      1. HTF bias agreement (long or short)
+      2. LTF zone gate  (Green zone → longs only, Yellow → shorts only)
+      3. Close breaks Key High (long) or Key Low (short)
+      4. Bounce/dip between the broken pivot and signal candle (MIN_BOUNCE)
+      5. Broken pivot within MAX_PIVOT_AGE candles of signal
+
+    Stop = Deviation Extreme (lowest low / highest high in ±2 window around
+           the broken Key pivot).
 
     after_ts: only accept signal candles strictly after this timestamp.
     """
     if bias == "neutral":
         return None, None, None
+
+    # Zone gate — early exit
+    if bias == "long"  and ltf_zone == "short": return None, None, None
+    if bias == "short" and ltf_zone == "long":  return None, None, None
 
     highs      = df["high"].values
     lows       = df["low"].values
@@ -301,9 +287,9 @@ def get_ltf_signal(df: pd.DataFrame, bias: str, ltf_zone: str = "neutral", after
         if signal_idx < LTF_PIVOT_LB + 5:
             continue
 
-        # Timestamp filter
+        # ── Timestamp filter ──────────────────────────────────────────────────
         if after_ts is not None:
-            candle_ts  = timestamps[signal_idx]
+            candle_ts = timestamps[signal_idx]
             if hasattr(candle_ts, 'tzinfo') and candle_ts.tzinfo is not None:
                 candle_ts = candle_ts.replace(tzinfo=None)
             after_naive = after_ts.replace(tzinfo=None) if hasattr(after_ts, 'tzinfo') and after_ts.tzinfo is not None else after_ts
@@ -312,56 +298,47 @@ def get_ltf_signal(df: pd.DataFrame, bias: str, ltf_zone: str = "neutral", after
                 continue
 
         entry = closes[signal_idx]
+        range_start = max(0, signal_idx - KEY_RANGE_LB)
 
-        # Zone gate — LTF BOS zone must agree with signal direction
-        if bias == "long"  and ltf_zone == "short": continue
-        if bias == "short" and ltf_zone == "long":  continue
+        # ── LONG — break above Key High ──────────────────────────────────────
+        if bias == "long":
+            # Key High = highest confirmed pivot high in lookback window
+            candidates = [(i, p) for i, p in ext_ph
+                          if range_start <= i < signal_idx]
+            if not candidates:
+                continue
+            kh_idx, kh_price = max(candidates, key=lambda x: x[1])
 
-        # ── INTERNAL (Green/Yellow zone) ──────────────────────────────────────
-        if signal_idx >= 2:
-            int_lh = highs[signal_idx-1] if highs[signal_idx-1] > highs[signal_idx-2] else None
-            int_hl = lows[signal_idx-1]  if lows[signal_idx-1]  < lows[signal_idx-2]  else None
-
-            if bias == "long" and int_lh is not None and entry > int_lh:
-                if is_inside_range(closes, highs, lows, signal_idx, "long"):
-                    continue  # entry still inside Key High/Low range — not a valid break
-                stop = float(min(lows[max(0, signal_idx - 2): signal_idx + 1]))
+            if entry > kh_price:
+                if signal_idx - kh_idx > MAX_PIVOT_AGE:
+                    continue
+                if not has_bounce(closes, kh_idx, signal_idx, "long"):
+                    continue
+                # Stop = deviation extreme of the Key High pivot
+                w0 = max(0, kh_idx - 2)
+                w1 = min(n, kh_idx + 3)
+                stop = float(min(lows[w0: w1]))
                 return "long", float(entry), stop
 
-            if bias == "short" and int_hl is not None and entry < int_hl:
-                if is_inside_range(closes, highs, lows, signal_idx, "short"):
-                    continue  # entry still inside Key High/Low range — not a valid break
-                stop = float(max(highs[max(0, signal_idx - 2): signal_idx + 1]))
-                return "short", float(entry), stop
-
-        # ── EXTERNAL — stop = deviation extreme of the broken pivot ───────────
-        if bias == "long":
-            for sh_idx, sh_price in reversed([ph for ph in ext_ph if ph[0] < signal_idx]):
-                if signal_idx - sh_idx > MAX_PIVOT_AGE:
-                    break
-                if entry > sh_price:
-                    if not has_bounce(closes, sh_idx, signal_idx, "long"):
-                        continue
-                    if is_inside_range(closes, highs, lows, signal_idx, "long"):
-                        continue  # entry still inside range
-                    w0 = max(0, sh_idx - 2)
-                    w1 = min(n, sh_idx + 3)
-                    stop = float(min(lows[w0: w1]))
-                    return "long", float(entry), stop
-
+        # ── SHORT — break below Key Low ──────────────────────────────────────
         elif bias == "short":
-            for sl_idx, sl_price in reversed([pl for pl in ext_pl if pl[0] < signal_idx]):
-                if signal_idx - sl_idx > MAX_PIVOT_AGE:
-                    break
-                if entry < sl_price:
-                    if not has_bounce(closes, sl_idx, signal_idx, "short"):
-                        continue
-                    if is_inside_range(closes, highs, lows, signal_idx, "short"):
-                        continue  # entry still inside range
-                    w0 = max(0, sl_idx - 2)
-                    w1 = min(n, sl_idx + 3)
-                    stop = float(max(highs[w0: w1]))
-                    return "short", float(entry), stop
+            # Key Low = lowest confirmed pivot low in lookback window
+            candidates = [(i, p) for i, p in ext_pl
+                          if range_start <= i < signal_idx]
+            if not candidates:
+                continue
+            kl_idx, kl_price = min(candidates, key=lambda x: x[1])
+
+            if entry < kl_price:
+                if signal_idx - kl_idx > MAX_PIVOT_AGE:
+                    continue
+                if not has_bounce(closes, kl_idx, signal_idx, "short"):
+                    continue
+                # Stop = deviation extreme of the Key Low pivot
+                w0 = max(0, kl_idx - 2)
+                w1 = min(n, kl_idx + 3)
+                stop = float(max(highs[w0: w1]))
+                return "short", float(entry), stop
 
     return None, None, None
 
@@ -571,9 +548,9 @@ def check_symbol(symbol: str):
         after_ts = trade_close_ts.get(symbol)
 
         # Compute LTF zone using same BOS logic as HTF — this is MXS Green/Yellow zone
-        # Use only last 30 candles to capture RECENT micro-structure (not full session history)
-        # This prevents full-session bullish bias overriding a recent Yellow zone
-        ltf_zone = get_htf_bias(df_ltf.tail(30))
+        # Use last 50 candles (~12.5h) — enough structure for lb=5 pivots while
+        # still capturing recent zone flips without full-session bullish override
+        ltf_zone = get_htf_bias(df_ltf.tail(50))
         log.info(f"  {symbol} 15M zone: {ltf_zone}")
 
         # Scan for new LTF signal
@@ -627,7 +604,7 @@ def run():
     log.info(f"Startup timestamp set: {startup_ts.strftime('%H:%M UTC')} — waiting for fresh candles")
 
     send_telegram(
-        "🤖 <b>MXS Alert Bot v9.10 started</b>\n"
+        "🤖 <b>MXS Alert Bot v10.0 started</b>\n"
         f"Monitoring: {coins}\n"
         "HTF: 1H (BTC/ETH/LINK) · 1D (SOL)\n"
         "━━━━━━━━━━━━━━━━\n"
