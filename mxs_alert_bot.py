@@ -47,7 +47,7 @@ ATR_LENGTH     = 14
 HTF_PIVOT_LB   = 5
 LTF_PIVOT_LB   = 3
 LTF_SCAN       = 4
-MAX_PIVOT_AGE  = 20  # max candles between broken pivot and signal — keeps signals fresh
+MAX_PIVOT_AGE  = 45  # max candles between broken pivot and signal — keeps signals fresh
 MIN_BOUNCE     = 2   # min candles moving against signal direction between pivot and signal
 KEY_RANGE_LB   = 50  # candles to compute Key High/Low range — signal must break outside
 CHECK_INTERVAL = 60 * 15
@@ -307,7 +307,7 @@ def get_ltf_signal(df: pd.DataFrame, bias: str, ltf_zone: str = "neutral", after
                           if range_start <= i < signal_idx]
             if not candidates:
                 continue
-            kh_idx, kh_price = max(candidates, key=lambda x: x[1])
+            kh_idx, kh_price = max(candidates, key=lambda x: x[1])  # highest pivot high
 
             if entry > kh_price:
                 if signal_idx - kh_idx > MAX_PIVOT_AGE:
@@ -327,7 +327,7 @@ def get_ltf_signal(df: pd.DataFrame, bias: str, ltf_zone: str = "neutral", after
                           if range_start <= i < signal_idx]
             if not candidates:
                 continue
-            kl_idx, kl_price = min(candidates, key=lambda x: x[1])
+            kl_idx, kl_price = min(candidates, key=lambda x: x[1])  # lowest pivot low
 
             if entry < kl_price:
                 if signal_idx - kl_idx > MAX_PIVOT_AGE:
